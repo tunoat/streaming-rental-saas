@@ -2,6 +2,16 @@ import { emailAddress, membership, passwordHash, reject } from './db.mjs';
 import { enqueue, uuid } from './jobs.mjs';
 
 const protectedJobs=['DELIVER_ACCESS','REVOKE_ACCESS','RECONCILE_DELIVERY','RECONCILE_REVOCATION'];
+async function recordServicePeriod(q,store,order,rental,profile,start,end) {
+  await q(`INSERT INTO rental_service_periods(store_id,order_id,rental_id,account_id,starts_at,ends_at,cost_rate_id,profile_count)
+    SELECT p.store_id,$2,$3,p.account_id,$5,$6,rate.id,
+      CASE WHEN rate.id IS NOT NULL THEN (SELECT count(*)::int FROM profiles active
+        WHERE (active.store_id,active.account_id)=(p.store_id,p.account_id) AND active.archived_at IS NULL) END
+    FROM profiles p LEFT JOIN LATERAL (
+      SELECT id FROM streaming_account_cost_rates WHERE (store_id,account_id)=(p.store_id,p.account_id)
+        AND effective_at<=clock_timestamp() ORDER BY effective_at DESC,id DESC LIMIT 1
+    ) rate ON true WHERE (p.store_id,p.id)=($1,$4)`,[store,order,rental,profile,start,end]);
+}
 export async function validateTarget(q,store,b) {
   if (protectedJobs.includes(b.type)) reject(409,'USE_WORKFLOW_ACTION');
   if (b.order_id || b.rental_id) reject(400,'INVALID_TARGET');
@@ -38,8 +48,10 @@ export async function applyEvidence(q,job,b) {
       AND p.status IN ('RESERVED','HELD') AND a.health='HEALTHY' AND a.checked_at>now()-interval '24 hours'`,
       [store,order,profile]);
     if (!orderRow || orderRow.subscription_until.getTime()<Date.parse(b.delivery_occurred_at)+orderRow.days*86400000) reject(409,'DELIVERY_NOT_ELIGIBLE');
-    await q(`INSERT INTO rentals(store_id,order_id,profile_id,starts_at,ends_at)
-      VALUES($1,$2,$3,$4::timestamptz,$4::timestamptz+$5*interval '24 hours')`,[store,order,profile,b.delivery_occurred_at,orderRow.days]);
+    const {rows:[created]}=await q(`INSERT INTO rentals(store_id,order_id,profile_id,starts_at,ends_at)
+      VALUES($1,$2,$3,$4::timestamptz,$4::timestamptz+$5*interval '24 hours') RETURNING id,starts_at,ends_at`,
+      [store,order,profile,b.delivery_occurred_at,orderRow.days]);
+    await recordServicePeriod(q,store,order,created.id,profile,created.starts_at,created.ends_at);
     await q("UPDATE profiles SET status='OCCUPIED' WHERE store_id=$1 AND id=$2",[store,profile]);
     await q("UPDATE orders SET status='FULFILLED' WHERE store_id=$1 AND id=$2",[store,order]);
   }
@@ -71,10 +83,26 @@ function customerUrl(value) {
   return url.href;
 }
 const customerAlias=value=>value==null || (typeof value==='string' && !value.trim())?null:shortText(value);
-const money = v => {
-  if (typeof v!=='string' || !/^(?:0|[1-9][0-9]{0,15})(?:\.[0-9]{1,2})?$/.test(v) || Number(v)<=0) reject(400,'INVALID_AMOUNT');
+const money = (v,allowZero=false) => {
+  if (typeof v!=='string' || !/^(?:0|[1-9][0-9]{0,15})(?:\.[0-9]{1,2})?$/.test(v) || (!allowZero&&Number(v)<=0)) reject(400,'INVALID_AMOUNT');
   return v;
 };
+function accountCostParts(body) {
+  const broker=money(body.broker_amount,true), subscription=money(body.subscription_amount,true);
+  const cents=value=>{
+    const [whole,fraction='']=value.split('.');
+    return BigInt(whole)*100n+BigInt(fraction.padEnd(2,'0'));
+  };
+  if (cents(broker)+cents(subscription)>999999999999999999n) reject(400,'INVALID_AMOUNT');
+  return [broker,subscription];
+}
+async function saveAccountCost(q,store,account,actor,[broker,subscription]) {
+  const {rows:[rate]}=await q(`INSERT INTO streaming_account_cost_rates(store_id,account_id,amount,actor_id,broker_amount,subscription_amount)
+    SELECT store_id,id,$3::numeric+$4::numeric,$5,$3::numeric,$4::numeric FROM accounts
+    WHERE (store_id,id)=($1,$2) RETURNING amount,broker_amount,subscription_amount,effective_at`,[store,account,broker,subscription,actor]);
+  if (!rate) reject(404,'NOT_FOUND');
+  return rate;
+}
 const streamingPlatform = value => {
   const platform=shortText(value).toLowerCase();
   if (platform!=='netflix') reject(400,'UNSUPPORTED_STREAMING_PLATFORM');
@@ -139,6 +167,10 @@ export function registerWorkflow(secured) {
       (SELECT count(*)::int FROM incidents WHERE store_id=$1) AS incident_count,
       (SELECT COALESCE(sum(amount),0.00)::text FROM wallet_ledger WHERE store_id=$1 AND transfer_id IS NOT NULL) AS credits_in,
       public.store_sales_summary($1) AS sales,
+      (SELECT jsonb_build_object('month',to_char(now() AT TIME ZONE 'Asia/Bangkok','YYYY-MM'),
+        'total',round(f.total,2)::text,'income',round(public.store_monthly_booked_sales($1),2)::text,
+        'configured',f.configured,'unconfigured',f.unconfigured)
+        FROM public.store_monthly_account_cost($1) f) AS monthly_cost,
       jsonb_build_object(
         'packages',EXISTS (SELECT 1 FROM streaming_packages WHERE store_id=$1),
         'accounts',EXISTS (SELECT 1 FROM accounts WHERE store_id=$1 AND health='HEALTHY'),
@@ -146,6 +178,34 @@ export function registerWorkflow(secured) {
         'customers',EXISTS (SELECT 1 FROM customers WHERE store_id=$1),
         'rentals',EXISTS (SELECT 1 FROM rentals WHERE store_id=$1)
       ) AS setup`,[s])).rows[0],{owner:true});
+  register('GET','monthly-sales',async(q,s)=>(await q(`
+    WITH dates AS (
+      SELECT (now() AT TIME ZONE 'Asia/Bangkok')::date AS today,
+        date_trunc('month',now() AT TIME ZONE 'Asia/Bangkok')::date AS first_day
+    ), booked AS (
+      SELECT o.booked_day,count(*)::int AS orders,count(*) FILTER (WHERE o.kind IN ('PURCHASE','RENEWAL'))::int AS sold,
+        sum(o.price) FILTER (WHERE o.kind IN ('PURCHASE','RENEWAL')) AS sales,
+        sum(o.allocated_cost) FILTER (WHERE o.status='FULFILLED') AS known_cost,
+        sum(o.price-o.allocated_cost) FILTER (WHERE o.status='FULFILLED') AS known_profit,
+        count(*) FILTER (WHERE o.status<>'FULFILLED' OR o.allocated_cost IS NULL)::int AS pending
+      FROM dates d CROSS JOIN LATERAL public.store_booked_order_lines($1,d.first_day,d.today+1) o
+      GROUP BY o.booked_day
+    )
+    SELECT (d.first_day+n)::text AS day,COALESCE(b.orders,0) AS orders,COALESCE(b.sold,0) AS sold,
+      round(COALESCE(b.sales,0),2)::text AS sales,round(b.known_cost,2)::text AS cost,
+      round(b.known_profit,2)::text AS profit,COALESCE(b.pending,0) AS pending
+    FROM dates d CROSS JOIN LATERAL generate_series(0,d.today-d.first_day) n
+    LEFT JOIN booked b ON b.booked_day=d.first_day+n ORDER BY d.first_day+n DESC`,[s])).rows,{owner:true});
+  register('GET','monthly-sales/:day',async(q,s,b,{params:{day}})=>{
+    if (!/^[1-9]\d{3}-\d{2}-\d{2}$/.test(day)||!Number.isFinite(Date.parse(day))||new Date(day).toISOString().slice(0,10)!==day)
+      reject(400,'INVALID_EXPIRY');
+    return (await q(`SELECT o.order_id,c.name AS customer_name,c.alias,o.package_name,o.platform,o.kind,o.status,o.days,
+      o.price::text AS price,
+      CASE WHEN o.status='FULFILLED' THEN round(o.allocated_cost,2)::text END AS cost,
+      CASE WHEN o.status='FULFILLED' THEN round(o.price-o.allocated_cost,2)::text END AS profit
+      FROM public.store_booked_order_lines($1,$2::date,$2::date+1) o
+      JOIN customers c ON (c.store_id,c.id)=($1,o.customer_id) ORDER BY o.order_id`,[s,day])).rows;
+  },{owner:true});
   register('GET','customer-renewals',async(q,s,b,req)=>(await q(`
     SELECT c.id,c.name,c.alias,c.url,COALESCE(current_rentals.items,'[]'::jsonb) AS rentals
       ${req.storeRole==='OWNER'?',(SELECT COALESCE(sum(l.amount),0)::numeric(18,2) FROM wallet_ledger l WHERE (l.store_id,l.customer_id)=(c.store_id,c.id)) AS balance':''}
@@ -209,12 +269,13 @@ export function registerWorkflow(secured) {
     return insert(q,`UPDATE streaming_email_addresses SET email=$3,password_hash=COALESCE($4,password_hash)
       WHERE store_id=$1 AND id=$2 RETURNING id,email,password_hash IS NOT NULL AS password_set`,[s,emailId,email,hash]);
   },{owner:true});
-  register('POST','accounts',async(q,s,b,req)=>{
+  register('POST','accounts',async(q,s,b,req,auth)=>{
     if (b.otp!=='123456') reject(400,'MOCK_BIND_INVALID');
     const platform=streamingPlatform(b.platform);
     const profileCount=b.profile_count===undefined?5:b.profile_count;
     if (!Number.isInteger(profileCount) || profileCount<1 || profileCount>100)
       reject(400,'INVALID_PROFILE_COUNT');
+    const costs=accountCostParts(b);
     const {rows:[credential]}=await q(`SELECT email,password_hash IS NOT NULL AS password_set FROM streaming_email_addresses
       WHERE store_id=$1 AND id=$2`,[s,validId(b.email_id)]);
     if (!credential?.password_set) reject(400,'STREAMING_EMAIL_PASSWORD_REQUIRED');
@@ -225,10 +286,30 @@ export function registerWorkflow(secured) {
     const account=await insert(q,'INSERT INTO accounts(store_id,platform,email) VALUES($1,$2,$3) RETURNING id',[s,platform,email]);
     await q(`INSERT INTO profiles(store_id,account_id,label)
       SELECT $1,$2,'profile'||number FROM generate_series(1,$3::integer) AS series(number)`,[s,account.id,profileCount]);
+    await saveAccountCost(q,s,account.id,auth.id,costs);
     return account;
   },{sale:true});
   register('POST','profiles',(q,s,b)=>insert(q,'INSERT INTO profiles(store_id,account_id,label) VALUES($1,$2,$3) RETURNING id',
     [s,validId(b.account_id),shortText(b.label)]),{sale:true});
+  register('GET','accounts/:accountId/cost',async(q,s,b,{params:{accountId}})=>{
+    const {rows:[entry]}=await q(`SELECT a.id,c.amount,c.effective_at,
+      COALESCE(c.broker_amount,0)::numeric(18,2) AS broker_amount,
+      COALESCE(c.subscription_amount,c.amount) AS subscription_amount,
+      round(c.amount/NULLIF(p.profile_count,0),2)::text AS profile_monthly_cost,
+      round(c.amount/(30::numeric*NULLIF(p.profile_count,0)),2)::text AS profile_daily_cost
+      FROM accounts a LEFT JOIN LATERAL (
+        SELECT amount,broker_amount,subscription_amount,effective_at FROM streaming_account_cost_rates
+        WHERE (store_id,account_id)=(a.store_id,a.id) AND effective_at<=now()
+        ORDER BY effective_at DESC,id DESC LIMIT 1
+      ) c ON true CROSS JOIN LATERAL (
+        SELECT count(*) AS profile_count FROM profiles
+        WHERE (store_id,account_id)=(a.store_id,a.id) AND archived_at IS NULL
+      ) p WHERE (a.store_id,a.id)=($1,$2)`,[s,accountId]);
+    if (!entry) reject(404,'NOT_FOUND');
+    return entry;
+  },{owner:true});
+  register('POST','accounts/:accountId/cost',(q,s,b,{params:{accountId}},auth)=>
+    saveAccountCost(q,s,accountId,auth.id,accountCostParts(b)),{owner:true});
   const profilePath='accounts/:accountId/profiles/:profileId/';
   register('POST',profilePath+'rename',async(q,s,b,{params:{accountId,profileId}})=>{
     const {rows:[profile]}=await q(`UPDATE profiles SET label=$4
@@ -312,6 +393,7 @@ export function registerWorkflow(secured) {
       const order=await insert(q,`INSERT INTO orders(store_id,customer_id,profile_id,amount,days,package_id,platform,status,kind,rental_id,reason,actor_id)
         VALUES($1,$2,$3,$4,$5,$6,$7,'FULFILLED',$8,$9,$10,$11) RETURNING id,kind`,
         [s,rental.customer_id,rental.profile_id,amount,days,renewal?rental.package_id:null,platform,kind,id,reason,auth.id]);
+      await recordServicePeriod(q,s,order.id,id,rental.profile_id,rental.ends_at,extension.rows[0].ends_at);
       if (renewal) await debit(q,s,rental.customer_id,order.id,amount);
       return {...order,ends_at:extension.rows[0].ends_at};
     },{owner:true,sale:renewal});

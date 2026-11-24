@@ -3,6 +3,8 @@ import { t, getLanguage, setLanguage, locale } from './i18n.js';
 const byId=id=>document.getElementById(id);
 const view=byId('view');
 let session,identity,store,role,selectedAccount,orderPoll,page='home',renderId=0;
+let adminOwnerId,adminShopId;
+const ownerDirectory={page:0,query:''}, shopDirectory={page:0,query:''};
 const errors={
   get USE_ACTIVE_STORE(){return t('กรุณาเลือกหนึ่งในร้านที่เปิดใช้งานก่อนขอเพิ่มร้าน');},
   get OWNER_UNAVAILABLE(){return t('กรุณาเลือก Owner ที่ยังใช้งานได้');},
@@ -146,36 +148,162 @@ function packageSalesTable(parent,packages) {
   summaryTable(parent,[t('บริการ'),t('แพ็กเกจ'),t('ระยะเวลา'),t('ราคาต่อรายการ'),t('ขายได้'),t('ยอดขาย')],
     packages.map(row=>[platformName(row.platform)??'—',row.package_id?row.name:t('ออเดอร์เดิม'),daysLabel(row.days),baht.format(row.unit_price),row.sold,baht.format(row.total)]));
 }
-function storeSales(details,path) {
-  const panel=element('section',undefined,details);
-  let loaded=false,loading=false;
-  details.addEventListener('toggle',async()=>{
-    if(!details.open||loaded||loading) return;
-    loading=true;
-    panel.replaceChildren();
-    element('p',t('กำลังโหลดยอดขาย…'),panel);
+function financialMetrics(parent,values){
+  const metrics=element('div',undefined,parent);
+  metrics.className='sales-metrics overview-finance';
+  for(const [label,value] of values){
+    const metric=element('div',undefined,metrics);
+    element('span',label,metric);
+    element('strong',String(value),metric);
+  }
+}
+function monthlyAccountCost(parent,cost){
+  const month=new Intl.DateTimeFormat(locale(),{month:'long',year:'numeric',timeZone:'Asia/Bangkok'});
+  element('p',month.format(new Date(cost.month+'-01T00:00:00Z')),parent);
+  financialMetrics(parent,[
+    [t('ยอดขายเดือนนี้'),baht.format(cost.income)],
+    [t('ต้นทุนคงที่รวม'),baht.format(cost.total)],
+    [t('บัญชีที่ตั้งต้นทุนแล้ว'),cost.configured],
+    [t('บัญชีที่ยังไม่ได้ตั้งต้นทุน'),cost.unconfigured]
+  ]);
+}
+function accountCostFields(cost={}){
+  return [
+    ['broker_amount',t('ค่าโบรกเกอร์ต่อเดือน (บาท)'),{type:'number',min:0,step:0.01,value:cost.broker_amount??'0.00'}],
+    ['subscription_amount',t('ค่าบริการสตรีมมิงต่อเดือน (บาท)'),{type:'number',min:0,step:0.01,value:cost.subscription_amount??'',placeholder:'419.00'}]
+  ];
+}
+function dailySalesReport(parent,days){
+  const date=new Intl.DateTimeFormat(locale(),{dateStyle:'medium',timeZone:'Asia/Bangkok'});
+  const dateLabel=day=>date.format(new Date(day+'T00:00:00Z'));
+  const currency=value=>value===null?'—':baht.format(value);
+  element('h2',t('ยอดขายและกำไรรายวัน'),parent);
+  element('p',t('จัดกลุ่มตามวันที่ซื้อในเวลาไทย กำไรจะคำนวณเมื่อส่งมอบแล้วและมีข้อมูลต้นทุน'),parent);
+  summaryTable(parent,[t('วันที่'),t('แพ็กเกจขายได้'),t('ยอดขาย'),t('ต้นทุนออเดอร์'),t('กำไรหลังหักต้นทุนบัญชี'),t('รอสรุปกำไร')],
+    days.map(row=>[dateLabel(row.day),row.sold,currency(row.sales),currency(row.cost),currency(row.profit),row.pending]));
+  const active=days.filter(row=>row.orders>0);
+  if(!active.length) return;
+  const label=element('label',t('เลือกวันเพื่อดูรายละเอียดออเดอร์'),parent);
+  const picker=element('select',undefined,label);
+  picker.replaceChildren(new Option(t('เลือกวันที่'),''),
+    ...active.map(row=>new Option(dateLabel(row.day),row.day)));
+  const details=element('div',undefined,parent);
+  let selection=0;
+  picker.onchange=async()=>{
+    const latest=++selection;
+    details.replaceChildren();
+    if(!picker.value) return;
+    element('p',t('กำลังโหลด…'),details);
     try {
-      const sales=await request(path+'sales');
-      if(!panel.isConnected) return;
-      panel.replaceChildren();
-      element('h2',t('ยอดขายตามออเดอร์'),panel);
-      const metrics=element('div',undefined,panel);
-      metrics.className='sales-metrics';
-      for(const [label,value] of [
-        [t('ยอดขายรวม'),baht.format(sales.total_sales)],[t('แพ็กเกจขายได้'),sales.packages_sold],
-        [t('ออเดอร์ใหม่'),sales.purchase_count],[t('ต่ออายุ'),sales.renewal_count],[t('ชดเชย'),sales.compensation_count]
-      ]){
-        const metric=element('div',undefined,metrics);
-        element('span',label,metric);
-        element('strong',String(value),metric);
-      }
-      packageSalesTable(panel,sales.packages);
-      loaded=true;
+      const rows=await shop('monthly-sales/'+picker.value);
+      if(latest!==selection||!details.isConnected) return;
+      details.replaceChildren();
+      summaryTable(details,[t('เลขอ้างอิงออเดอร์'),t('ชื่อลูกค้า'),t('แพ็กเกจ'),t('สถานะ'),t('ยอดขาย'),t('ต้นทุนออเดอร์'),t('กำไรหลังหักต้นทุนบัญชี')],
+        rows.map(row=>[row.order_id.slice(0,8),customerLabel({name:row.customer_name,alias:row.alias}),
+          row.kind==='COMPENSATION'?t('ชดเชย'):row.package_name??t('ออเดอร์เดิม'),
+          status[row.status]??row.status,currency(row.price),currency(row.cost),currency(row.profit)]));
     } catch(error){
-      panel.replaceChildren();
-      element('p',error.message,panel);
-    } finally {loading=false;}
-  });
+      if(latest!==selection||!details.isConnected) return;
+      details.replaceChildren();
+      element('p',error.message,details);
+    }
+  };
+}
+function directoryButtons(parent,rows,state,select,format,searchLabel){
+  const pageSize=8;
+  const label=element('label',searchLabel,parent);
+  label.className='directory-search';
+  const search=element('input',undefined,label);
+  Object.assign(search,{type:'search',value:state.query});
+  const panel=element('div',undefined,parent);
+  function draw(){
+    panel.replaceChildren();
+    const visible=rows.filter(row=>format(row)[0].toLowerCase().includes(state.query.trim().toLowerCase()));
+    const pages=Math.max(1,Math.ceil(visible.length/pageSize));
+    const current=state.page=Math.min(state.page,pages-1);
+    const grid=element('div',undefined,panel);
+    grid.className='directory-grid';
+    for(const row of visible.slice(current*pageSize,(current+1)*pageSize)){
+      const button=element('button',undefined,grid);
+      button.className='inventory-account';
+      const [name,details]=format(row);
+      const caption=element('span',undefined,button);
+      element('strong',name,caption);
+      element('small',details,caption);
+      button.onclick=()=>select(row);
+    }
+    if(!visible.length) element('p',t('ยังไม่มีรายการ'),panel);
+    if(pages<=1) return;
+    const pagination=element('div',undefined,panel);
+    pagination.className='directory-pagination';
+    const previous=element('button',t('ก่อนหน้า'),pagination);
+    previous.disabled=current===0;
+    previous.onclick=()=>{state.page=current-1;draw();};
+    element('span',t('หน้า ')+(current+1)+' / '+pages,pagination);
+    const next=element('button',t('ถัดไป'),pagination);
+    next.disabled=current===pages-1;
+    next.onclick=()=>{state.page=current+1;draw();};
+  }
+  search.oninput=()=>{state.query=search.value;state.page=0;draw();};
+  draw();
+}
+async function adminStoreDirectory(current){
+  const owners=await request('admin/owners');
+  if(!current()) return;
+  const owner=owners.find(row=>row.id===adminOwnerId);
+  if(!owner){
+    element('h1',t('ร้านค้า'));
+    element('h2',t('เลือก Owner'));
+    if(!owners.length) element('p',t('เพิ่มผู้ใช้ระดับ Owner จากไอคอนรูปคนก่อนสร้างร้าน'));
+    else directoryButtons(view,owners,ownerDirectory,row=>{
+      adminOwnerId=row.id;adminShopId=undefined;shopDirectory.page=0;shopDirectory.query='';render();
+    },row=>[row.username,t('จำนวนร้าน: ')+row.store_count],t('ค้นหา Owner'));
+    return;
+  }
+  const [overview,stores]=await Promise.all([
+    request('admin/owners/'+owner.id+'/overview'),request('admin/stores?owner_id='+owner.id)
+  ]);
+  if(!current()) return;
+  const selected=stores.find(row=>row.id===adminShopId);
+  if(!selected){
+    const back=element('button',t('กลับไปรายชื่อ Owner'));
+    back.onclick=()=>{adminOwnerId=undefined;render();};
+    element('h1','Owner · '+overview.username);
+    element('h2',t('ต้นทุนบัญชีรายเดือนรวมทุกร้าน'));
+    monthlyAccountCost(view,overview.monthly_cost);
+    element('h2',t('ร้านค้าของ Owner'));
+    if(!stores.length) element('p',t('ยังไม่มีร้านค้า'));
+    else directoryButtons(view,stores,shopDirectory,row=>{adminShopId=row.id;render();},
+      row=>[row.name,storeStatus[row.status]],t('ค้นหาร้านค้า'));
+    if(owner.active) form(t('สร้างร้านค้า'),[['name',t('ชื่อร้าน')],['current_password',t('รหัสผ่านปัจจุบัน'),'password']],
+      data=>request('admin/stores',{...data,owner_id:owner.id}));
+    return;
+  }
+  const path='admin/stores/'+selected.id+'/';
+  const sales=await request(path+'sales');
+  if(!current()) return;
+  const back=element('button',t('กลับไปรายการร้าน'));
+  back.onclick=()=>{adminShopId=undefined;render();};
+  element('h1',selected.name);
+  const end=new Date(Date.parse(selected.expires_at)-1);
+  element('p',storeStatus[selected.status]+t(' · หมดอายุ ')+storeDate.format(end)+t(' น. (เวลาไทย)')+
+    (Date.parse(selected.expires_at)<=Date.now()?t(' · หมดอายุแล้ว'):''));
+  element('h2',t('ต้นทุนบัญชีรายเดือนของร้าน'));
+  monthlyAccountCost(view,sales.monthly_cost);
+  element('h2',t('ยอดขายตามออเดอร์'));
+  financialMetrics(view,[
+    [t('ยอดขายรวม'),baht.format(sales.total_sales)],[t('แพ็กเกจขายได้'),sales.packages_sold],
+    [t('ออเดอร์ใหม่'),sales.purchase_count],[t('ต่ออายุ'),sales.renewal_count],[t('ชดเชย'),sales.compensation_count]
+  ]);
+  packageSalesTable(view,sales.packages);
+  if(selected.status==='CLOSED') return;
+  const states=['ACTIVE','SUSPENDED'].map(value=>[value,storeStatus[value],value===selected.status]);
+  form(t('สถานะร้านค้า'),[['status',t('สถานะ'),'',states]],
+    data=>request(path+'status',{...data,expected_status:selected.status}),view,t('บันทึกสถานะ'));
+  form(t('วันหมดอายุ'),[['date',t('เลือกวันจากปฏิทิน'),{type:'date',value:storeDay.format(end)}]],
+    data=>request(path+'expiry',{...data,mode:'CALENDAR',expected_expiry:selected.expires_at}),view,t('บันทึกวันหมดอายุ'));
+  form(t('ปรับวันหมดอายุแบบเร็ว'),[],
+    ()=>request(path+'expiry',{mode:'ADD_MONTH',expected_expiry:selected.expires_at}),view,t('+1 เดือน'));
 }
 function allocationForm(orders,customers,parent) {
   const names=new Map(customers.map(customer=>[customer.id,customerLabel(customer)]));
@@ -252,7 +380,7 @@ function nav() {
     button.onclick=()=>{page=key;render();};
   }
 }
-function ownerOverview(overview,renewals) {
+function ownerOverview(overview,renewals,dailySales) {
   const go=(parent,label,destination,style)=>{
     const button=element('button',label,parent);
     button.className=style;
@@ -317,6 +445,11 @@ function ownerOverview(overview,renewals) {
     element('small',help,tile);
   }
   packageSalesTable(finance,overview.sales.packages.filter(row=>row.package_id));
+  element('h2',t('ต้นทุนบัญชีรายเดือนของร้าน'),finance);
+  monthlyAccountCost(finance,overview.monthly_cost);
+  const daily=element('section');
+  daily.className='overview-panel';
+  dailySalesReport(daily,dailySales);
 
   const columns=element('div');
   columns.className='overview-columns';
@@ -379,32 +512,7 @@ async function render() {
   try {
     if(identity.is_super||identity.is_admin){
       if(page==='home'){
-        const [stores,owners]=await Promise.all([request('admin/stores'),request('admin/owners')]);
-        if(!current()) return;
-        element('h1',t('ร้านค้า'));
-        if(!stores.length) element('p',t('ยังไม่มีร้านค้า'));
-        for(const row of stores){
-          const details=element('details');
-          const end=new Date(Date.parse(row.expires_at)-1);
-          const summary=element('summary',undefined,details);
-          element('span',row.name+' · '+storeStatus[row.status],summary);
-          element('span',t(' · หมดอายุ ')+storeDate.format(end)+t(' น. (เวลาไทย)')+
-            (Date.parse(row.expires_at)<=Date.now()?t(' · หมดอายุแล้ว'):''),summary);
-          const path='admin/stores/'+row.id+'/';
-          storeSales(details,path);
-          if(row.status==='CLOSED') continue;
-          const selected=['ACTIVE','SUSPENDED'].map(value=>[value,storeStatus[value],value===row.status]);
-          form(t('สถานะร้านค้า'),[['status',t('สถานะ'),'',selected]],
-            data=>request(path+'status',{...data,expected_status:row.status}),details,t('บันทึกสถานะ'));
-          form(t('วันหมดอายุ'),[['date',t('เลือกวันจากปฏิทิน'),{type:'date',value:storeDay.format(end)}]],
-            data=>request(path+'expiry',{...data,mode:'CALENDAR',expected_expiry:row.expires_at}),details,t('บันทึกวันหมดอายุ'));
-          form(t('ปรับวันหมดอายุแบบเร็ว'),[],
-            ()=>request(path+'expiry',{mode:'ADD_MONTH',expected_expiry:row.expires_at}),details,t('+1 เดือน'));
-        }
-        if(owners.length) form(t('สร้างร้านค้า'),[['name',t('ชื่อร้าน')],
-          ['owner_id',t('เจ้าของร้าน'),'',[['',t('เลือก Owner')],...choices(owners,row=>row.username)]],
-          ['current_password',t('รหัสผ่านปัจจุบัน'),'password']],data=>request('admin/stores',data));
-        else element('p',t('เพิ่มผู้ใช้ระดับ Owner จากไอคอนรูปคนก่อนสร้างร้าน'));
+        await adminStoreDirectory(current);
       } else if(page==='admin-settings'){
         element('h1',identity.is_super?t('ตั้งค่า Super Admin'):t('ตั้งค่า Admin'));
         passwordForm(data=>request('admin/password',data));
@@ -436,9 +544,9 @@ async function render() {
       }
     } else if(page==='home'){
       if(role==='OWNER'){
-        const [overview,renewals]=await Promise.all([shop('owner-overview'),shop('customer-renewals')]);
+        const [overview,renewals,dailySales]=await Promise.all([shop('owner-overview'),shop('customer-renewals'),shop('monthly-sales')]);
         if(!current()) return;
-        ownerOverview(overview,renewals);
+        ownerOverview(overview,renewals,dailySales);
         notice('');
         return;
       }
@@ -521,6 +629,19 @@ async function render() {
         const back=element('button',t('กลับไปยังรายการบัญชี'),heading);
         back.className='inventory-back';
         back.onclick=()=>{selectedAccount=undefined;render();};
+        if(role==='OWNER'){
+          const path='accounts/'+account.id+'/cost';
+          const cost=await shop(path);
+          if(!current()) return;
+          const costs=element('section');
+          costs.className='inventory-panel';
+          if(cost.amount!==null) financialMetrics(costs,[
+            [t('ต้นทุนคงที่รวม'),baht.format(cost.amount)],
+            [t('ต้นทุนต่อโปรไฟล์ต่อเดือน'),cost.profile_monthly_cost===null?'—':baht.format(cost.profile_monthly_cost)],
+            [t('ต้นทุนต่อโปรไฟล์ต่อวัน'),cost.profile_daily_cost===null?'—':baht.format(cost.profile_daily_cost)]
+          ]);
+          form(t('ต้นทุนบัญชีสตรีมมิง'),accountCostFields(cost),data=>shop(path,data),costs,t('บันทึกต้นทุน'));
+        }
         const entries=profiles.filter(profile=>profile.account_id===account.id);
         const panel=element('section');
         panel.className='inventory-panel';
@@ -585,7 +706,8 @@ async function render() {
         const bind=form(t('เพิ่มบัญชีสตรีมมิงจำลอง'),[
           ['platform',t('แพลตฟอร์ม'),'',streamingPlatforms],['email_id',t('อีเมลบัญชีสตรีมมิง'),'',[]],
           ['otp',t('OTP จำลอง'),{type:'text',inputMode:'numeric',maxLength:6,pattern:'[0-9]{6}',autocomplete:'off'}],
-          ['profile_count',t('จำนวนโปรไฟล์'),{type:'number',min:1,max:100,step:1,value:5}]
+          ['profile_count',t('จำนวนโปรไฟล์'),{type:'number',min:1,max:100,step:1,value:5}],
+          ...accountCostFields()
         ],data=>shop('accounts',{...data,profile_count:Number(data.profile_count)}),bindPanel,t('Bind บัญชี'));
         element('p',t('เลือกอีเมลที่ตั้งรหัสผ่านไว้ ใช้ OTP จำลอง 123456'),bindPanel).className='inventory-hint';
         const showEmails=()=>{
@@ -812,6 +934,10 @@ byId('logout').onclick=async()=>{
   clearTimeout(orderPoll);
   session=undefined;
   selectedAccount=undefined;
+  adminOwnerId=undefined;
+  adminShopId=undefined;
+  ownerDirectory.page=shopDirectory.page=0;
+  ownerDirectory.query=shopDirectory.query='';
   byId('user-level').textContent=t('บัญชีผู้ใช้');
   byId('owner-settings').hidden=true;
   byId('workspace').hidden=true;

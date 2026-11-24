@@ -112,5 +112,9 @@ details {margin-top:.8rem}
 .inventory-profile-actions > * {min-width:0}
 .inventory-profile-actions form {margin-bottom:0}
 .inventory-advanced {margin-top:0}
+.directory-grid {display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,13rem),1fr));gap:.65rem;margin:.7rem 0}
+.directory-search {max-width:22rem}
+.directory-pagination {display:flex;align-items:center;gap:.65rem;margin:.7rem 0;flex-wrap:wrap}
+.directory-pagination button:disabled {cursor:default}
 @media(max-width:760px) { .inventory-columns,.inventory-profile-actions {grid-template-columns:1fr} }
 

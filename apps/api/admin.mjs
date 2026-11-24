@@ -53,19 +53,35 @@ export function registerAdmin(app, secured) {
     is_owner:!auth.is_super&&!auth.is_admin&&(await q('SELECT '+isOwner+' AS available',[auth.id])).rows[0].available,
     stores:(await q('SELECT s.id,s.name,m.role FROM stores s JOIN memberships m ON m.store_id=s.id WHERE m.user_id=$1',[auth.id])).rows
   }));
-  secured('GET','/v1/admin/stores',async(q,auth) => {
+  secured('GET','/v1/admin/stores',async(q,auth,{query}) => {
     if (!auth.is_super) reject(403,'FORBIDDEN');
-    return (await q('SELECT id,name,plan,status,expires_at FROM stores ORDER BY name')).rows;
+    const owner=query.owner_id??null;
+    if (owner!==null&&(typeof owner!=='string'||!uuid.test(owner))) reject(400,'INVALID_ID');
+    return (await q(`SELECT s.id,s.name,s.plan,s.status,s.expires_at FROM stores s
+      WHERE $1::uuid IS NULL OR EXISTS (SELECT 1 FROM memberships m
+        WHERE m.store_id=s.id AND m.user_id=$1 AND m.role='OWNER') ORDER BY s.name,s.id`,[owner])).rows;
   });
   secured('GET','/v1/admin/stores/:storeId/sales',async(q,auth,{params:{storeId}})=>{
     if (!auth.is_super) reject(403,'FORBIDDEN');
-    const {rows:[{report}]}=await q('SELECT public.admin_store_sales($1,$2) AS report',[storeId,auth.token]);
+    const {rows:[{report,monthly_cost}]}=await q(`SELECT public.admin_store_sales($1,$2) AS report,
+      public.admin_monthly_account_cost(NULL,$1,$2) AS monthly_cost`,[storeId,auth.token]);
     if (!report) reject(404,'NOT_FOUND');
-    return report;
+    return {...report,monthly_cost};
   });
   secured('GET','/v1/admin/owners',async(q,auth)=>{
     if (!auth.is_super) reject(403,'FORBIDDEN');
-    return (await q(`SELECT u.id,u.username FROM users u WHERE ${eligibleOwners} ORDER BY u.username`)).rows;
+    return (await q(`SELECT u.id,u.username,u.active,
+      (SELECT count(*)::int FROM memberships m WHERE m.user_id=u.id AND m.role='OWNER') AS store_count
+      FROM users u WHERE (${eligibleOwners}) OR EXISTS (
+        SELECT 1 FROM memberships m WHERE m.user_id=u.id AND m.role='OWNER')
+      ORDER BY u.username,u.id`)).rows;
+  });
+  secured('GET','/v1/admin/owners/:ownerId/overview',async(q,auth,{params:{ownerId}})=>{
+    if (!auth.is_super) reject(403,'FORBIDDEN');
+    const {rows:[owner]}=await q(`SELECT id,username,public.admin_monthly_account_cost(id,NULL,$2) AS monthly_cost
+      FROM users WHERE id=$1 AND NOT is_super AND NOT is_admin AND (${isOwner})`,[ownerId,auth.token]);
+    if (!owner) reject(404,'NOT_FOUND');
+    return owner;
   });
   secured('POST','/v1/admin/stores/:storeId/status',async(q,auth,{body,params:{storeId}})=>{
     if (!auth.is_super) reject(403,'FORBIDDEN');

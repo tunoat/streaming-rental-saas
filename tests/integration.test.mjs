@@ -102,13 +102,14 @@ integration('owner can approve mock credit and allocate verified inventory to mo
   const credential={platform:'netflix',email:uid()+'@example.invalid',password:'Demo-Bind-Only!'};
   await ok('POST',route+'streaming-emails',owner,{email:credential.email,password:'short'},400);
   const email=await ok('POST',route+'streaming-emails',owner,{email:credential.email,password:credential.password});
-  const binding={platform:'netflix',email_id:email.id,otp:'123456',profile_count:1};
+  const binding={platform:'netflix',email_id:email.id,otp:'123456',profile_count:1,broker_amount:'0',subscription_amount:'0'};
   assert.deepEqual(await ok('GET',storePath(B)+'streaming-emails',outsider),[]);
   await ok('POST',storePath(B)+'accounts',outsider,binding,400);
   await ok('POST',route+'accounts',owner,{...binding,platform:'other'},400);
   await ok('POST',route+'accounts',owner,{...binding,otp:undefined},400);
   await ok('POST',route+'accounts',owner,{...binding,otp:'000000'},400);
   await ok('POST',route+'accounts',owner,{...binding,profile_count:0},400);
+  await ok('POST',route+'accounts',owner,{...binding,broker_amount:undefined},400);
   assert.deepEqual(await ok('GET',route+'accounts',owner),[]);
   const account=await ok('POST',route+'accounts',owner,binding);
   const listed=(await ok('GET',route+'streaming-emails',owner))[0];
@@ -264,7 +265,7 @@ integration('Netflix creates five numbered profiles when no count is supplied',a
   const updated=await ok('POST',path+'streaming-emails/'+email.id,owner,{email:uid()+'@example.invalid'});
   assert.notEqual(updated.email,email.email);
   const account=await ok('POST',path+'accounts',owner,{
-    platform:'netflix',email_id:email.id,otp:'123456'
+    platform:'netflix',email_id:email.id,otp:'123456',broker_amount:'0',subscription_amount:'0'
   });
   const profiles=(await ok('GET',path+'profiles',owner)).filter(profile=>profile.account_id===account.id);
   assert.deepEqual(profiles.map(profile=>profile.label),['profile1','profile2','profile3','profile4','profile5']);
@@ -431,5 +432,68 @@ integration('delegated Admin can create an Owner and approve a first store but c
   const approved=await ok('POST',review,delegated,{status:'APPROVED',current_password:password});
   const after=await ok('GET','/v1/me',firstOwner);
   assert.ok(after.stores.some(store=>store.id===approved.store_id&&store.role==='OWNER'));
+});
+integration('monthly fixed fees and daily order profit use the two cost components independently',async()=>{
+  const path=storePath(B);
+  async function addAccount(target,profile_count,broker_amount,subscription_amount) {
+    const email=await ok('POST',target+'streaming-emails',outsider,{email:uid()+'@example.invalid',password:'Demo-Mail-Only!'});
+    return ok('POST',target+'accounts',outsider,{platform:'netflix',email_id:email.id,otp:'123456',profile_count,broker_amount,subscription_amount});
+  }
+  const netflix=await addAccount(path,4,'20','400');
+  await addAccount(path,1,'0','199');
+  const costPath=path+'accounts/'+netflix.id+'/cost';
+  await ok('GET',costPath,owner,undefined,403);
+  const rate=await ok('GET',costPath,outsider);
+  assert.deepEqual([rate.broker_amount,rate.subscription_amount,rate.amount],['20.00','400.00','420.00']);
+  assert.deepEqual([rate.profile_monthly_cost,rate.profile_daily_cost],['105.00','3.50']);
+  const initial=(await ok('GET',path+'owner-overview',outsider)).monthly_cost;
+  assert.deepEqual(initial,{month:initial.month,total:'619.00',income:'192.00',configured:2,unconfigured:0});
+  assert.match(initial.month,/^\d{4}-\d{2}$/);
+  const {digest}=await import('../apps/api/db.mjs');
+  const {WorkerClient}=await import('../packages/shared/worker-client.mts');
+  const {MockStreamingProviderAdapter}=await import('../apps/mock-worker/worker.mjs');
+  const workerId='sales-'+uid(), workerToken=token();
+  await db.query("INSERT INTO workers VALUES($1,$2,now()+interval '1 day')",[workerId,digest(workerToken)]);
+  await db.query('INSERT INTO worker_stores VALUES($1,$2)',[workerId,B]);
+  const salesWorker=new WorkerClient(base,workerToken,workerId);
+  async function complete(type,id) {
+    const {job,lease_token,fencing_token}=await salesWorker.claim([type]);
+    assert.equal(job.id,id);
+    const lease={worker_id:workerId,lease_token,fencing_token};
+    await salesWorker.start(job.id,lease);
+    assert.equal((await salesWorker.report(job.id,{...lease,...new MockStreamingProviderAdapter().execute(job)})).status,'SUCCEEDED');
+  }
+  const verification=await ok('POST',path+'bot-jobs',outsider,{type:'VERIFY_SUBSCRIPTION',account_id:netflix.id,reason:'Monthly cost verification'},201);
+  await complete('VERIFY_SUBSCRIPTION',verification.id);
+  const oneDay=(await ok('GET',path+'orders?scope=active',outsider)).find(row=>row.days===1);
+  const payment=await ok('POST',path+'payment-requests',outsider,{customer_id:oneDay.customer_id,amount:'179'});
+  const transfer=await ok('POST',path+'transfers',outsider,{payment_id:payment.id,amount:'179',evidence:'mock-'+uid()});
+  await ok('POST',path+'transfers/'+transfer.id+'/approve',outsider,{confirm:true});
+  const plan=await ok('POST',path+'packages',outsider,{platform:'netflix',name:'Monthly margin test',amount:'179',days:30});
+  const thirtyDays=await ok('POST',path+'orders',outsider,{customer_id:oneDay.customer_id,package_id:plan.id,amount:'179',days:30,confirm:true});
+  for(const order_id of [oneDay.id,thirtyDays.id]){
+    const job=await ok('POST',path+'allocate',outsider,{order_id,account_id:netflix.id});
+    await complete('DELIVER_ACCESS',job.job_id);
+  }
+  await ok('POST',costPath,outsider,{broker_amount:'50',subscription_amount:'449'});
+  const [today]=await ok('GET',path+'monthly-sales',outsider);
+  assert.deepEqual([today.sales,today.cost,today.profit,today.sold,today.pending],['371.00','108.50','85.50',9,7]);
+  const details=await ok('GET',path+'monthly-sales/'+today.day,outsider);
+  for(const [id,cost,profit] of [[oneDay.id,'3.50','11.50'],[thirtyDays.id,'105.00','74.00']]){
+    const row=details.find(entry=>entry.order_id===id);
+    assert.deepEqual([row.cost,row.profit],[cost,profit]);
+  }
+  await ok('GET',path+'monthly-sales',owner,undefined,403);
+  const monthly=(await ok('GET',path+'owner-overview',outsider)).monthly_cost;
+  assert.deepEqual(monthly,{month:initial.month,total:'698.00',income:'371.00',configured:2,unconfigured:0});
+  assert.deepEqual((await ok('GET','/v1/admin/stores/'+B+'/sales',admin)).monthly_cost,monthly);
+  const {rows:[{user_id}]}=await db.query("SELECT user_id FROM memberships WHERE store_id=$1 AND role='OWNER'",[B]);
+  const additional=await ok('POST','/v1/admin/stores',admin,{
+    name:'Another cost store',owner_id:user_id,current_password:'Updated-Admin-Test-2026!'
+  });
+  const otherPath=storePath(additional.id);
+  await addAccount(otherPath,2,'10','40');
+  const rollup=(await ok('GET','/v1/admin/owners/'+user_id+'/overview',admin)).monthly_cost;
+  assert.deepEqual(rollup,{month:initial.month,total:'748.00',income:'371.00',configured:3,unconfigured:0});
 });
 
