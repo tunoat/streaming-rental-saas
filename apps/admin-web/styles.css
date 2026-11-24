@@ -5,6 +5,8 @@ header {position:relative;background:#123934;color:white;padding:1rem max(1rem,c
 header:has(#owner-settings:not([hidden])) {padding-right:max(4.5rem,calc((100vw - 59rem)/2))}
 #owner-settings {position:absolute;right:max(1rem,calc((100vw - 66rem)/2));top:.65rem;display:grid;place-items:center;width:2.75rem;height:2.75rem;padding:0;border-radius:50%;border-color:#a8c7bc}
 header span {background:#ffdf9b;color:#382605;padding:.2rem .7rem;border-radius:.4rem;font-size:.92rem}
+#language-switch {margin-inline-start:auto;min-height:2.1rem;background:transparent;border-color:#a8c7bc;padding:.2rem .65rem}
+#language-switch:hover {background:#236952}
 main {max-width:68rem;margin:auto;padding:1rem}
 h1 {margin:.3rem 0 1rem}
 h2 {font-size:1.15rem}
