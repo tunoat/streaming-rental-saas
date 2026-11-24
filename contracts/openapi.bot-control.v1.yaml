@@ -1,0 +1,675 @@
+openapi: 3.1.0
+info:
+  title: Streaming Rental SaaS — Bot Control API (Proposed Contract)
+  version: 1.0.0-draft
+  description: Design contract for integration between SaaS backend and independently developed bot worker. NOT
+    implemented or verified. Phase 1 MOCK only.
+servers:
+- url: http://localhost:3000
+  description: Local development only
+tags:
+- name: Admin
+- name: Worker
+security:
+- bearerAuth: []
+paths:
+  /v1/stores/{storeId}/bot-jobs:
+    post:
+      tags:
+      - Admin
+      summary: Queue an authorized bot task
+      operationId: post_v1_stores_storeId_bot_jobs
+      responses:
+        '201':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthenticated
+        '403':
+          description: Forbidden
+        '409':
+          description: Conflict / stale fencing / invalid transition
+        '429':
+          description: Rate limited
+      description: Tenant RBAC enforced; no direct provider execution. Priority derived server-side, requested priority
+        not authoritative.
+      parameters: &id001
+      - &id002
+        name: storeId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobCreate'
+    get:
+      tags:
+      - Admin
+      summary: List jobs for store
+      operationId: get_v1_stores_storeId_bot_jobs
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Job'
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthenticated
+        '403':
+          description: Forbidden
+        '409':
+          description: Conflict / stale fencing / invalid transition
+        '429':
+          description: Rate limited
+      description: Paginated in implementation; filter by status/type; never return lease token or credentials.
+      parameters: *id001
+  /v1/stores/{storeId}/bot-jobs/{jobId}:
+    get:
+      tags:
+      - Admin
+      summary: Get job status and sanitized history
+      operationId: get_v1_stores_storeId_bot_jobs_jobId
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthenticated
+        '403':
+          description: Forbidden
+        '409':
+          description: Conflict / stale fencing / invalid transition
+        '429':
+          description: Rate limited
+      parameters: &id003
+      - *id002
+      - name: jobId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+  /v1/stores/{storeId}/bot-jobs/{jobId}/cancel:
+    post:
+      tags:
+      - Admin
+      summary: Request safe cancellation
+      operationId: post_v1_stores_storeId_bot_jobs_jobId_cancel
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthenticated
+        '403':
+          description: Forbidden
+        '409':
+          description: Conflict / stale fencing / invalid transition
+        '429':
+          description: Rate limited
+      description: Cancellation is cooperative and may require reconciliation if external outcome is uncertain.
+      parameters: *id003
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelRequest'
+  /v1/stores/{storeId}/bot-jobs/{jobId}/retry:
+    post:
+      tags:
+      - Admin
+      summary: Request policy-allowed retry
+      operationId: post_v1_stores_storeId_bot_jobs_jobId_retry
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthenticated
+        '403':
+          description: Forbidden
+        '409':
+          description: Conflict / stale fencing / invalid transition
+        '429':
+          description: Rate limited
+      description: Revalidates authorization, health, account holds, max attempts and state.
+      parameters: *id003
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelRequest'
+  /v1/worker/jobs/claim:
+    post:
+      tags:
+      - Worker
+      summary: Claim one eligible job with lease and fencing
+      operationId: post_v1_worker_jobs_claim
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimResponse'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthenticated
+        '403':
+          description: Forbidden
+        '409':
+          description: Conflict / stale fencing / invalid transition
+        '429':
+          description: Rate limited
+        '204':
+          description: No eligible jobs
+      description: mTLS or OAuth2 client credentials; server selects job by priority, aging and store concurrency
+        (max 4 running/store). 204 when none. Worker identity bound to token and permitted scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimRequest'
+  /v1/worker/jobs/{jobId}/start:
+    post:
+      tags:
+      - Worker
+      summary: Transition claimed job to RUNNING
+      operationId: post_v1_worker_jobs_jobId_start
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthenticated
+        '403':
+          description: Forbidden
+        '409':
+          description: Conflict / stale fencing / invalid transition
+        '429':
+          description: Rate limited
+      description: Validate lease token, worker ID, fencing token and expiry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Heartbeat'
+  /v1/worker/jobs/{jobId}/heartbeat:
+    post:
+      tags:
+      - Worker
+      summary: Renew job lease
+      operationId: post_v1_worker_jobs_jobId_heartbeat
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthenticated
+        '403':
+          description: Forbidden
+        '409':
+          description: Conflict / stale fencing / invalid transition
+        '429':
+          description: Rate limited
+      description: Reject stale token; never resurrect expired lease.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Heartbeat'
+  /v1/worker/jobs/{jobId}/complete:
+    post:
+      tags:
+      - Worker
+      summary: Submit verified execution outcome
+      operationId: post_v1_worker_jobs_jobId_complete
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthenticated
+        '403':
+          description: Forbidden
+        '409':
+          description: Conflict / stale fencing / invalid transition
+        '429':
+          description: Rate limited
+      description: Result is evidence, not permission to mutate order/rental directly. Backend revalidates all invariants
+        transactionally; MOCK outcomes cannot fulfill real production rentals.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobResult'
+  /v1/worker/jobs/{jobId}/fail:
+    post:
+      tags:
+      - Worker
+      summary: Report failure/inconclusive result
+      operationId: post_v1_worker_jobs_jobId_fail
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthenticated
+        '403':
+          description: Forbidden
+        '409':
+          description: Conflict / stale fencing / invalid transition
+        '429':
+          description: Rate limited
+      description: 'Timeout/network: policy retries; confirmed locked/invalid: BLOCKED; inconclusive fail closed.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobResult'
+  /v1/worker/jobs/{jobId}:
+    get:
+      tags:
+      - Worker
+      summary: Read assigned job state
+      operationId: get_v1_worker_jobs_jobId
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthenticated
+        '403':
+          description: Forbidden
+        '409':
+          description: Conflict / stale fencing / invalid transition
+        '429':
+          description: Rate limited
+      description: Only jobs assigned to this worker and permitted store scopes.
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Admin session access token OR worker-scoped token, endpoints enforce separate audiences and RBAC
+  schemas:
+    Error:
+      type: object
+      required:
+      - code
+      - message
+      - request_id
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: string
+        retryable:
+          type: boolean
+    Job:
+      type: object
+      required:
+      - id
+      - store_id
+      - type
+      - status
+      - priority
+      - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        store_id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum:
+          - VERIFY_LOGIN
+          - VERIFY_SUBSCRIPTION
+          - VERIFY_PROFILE_READINESS
+          - DELIVER_ACCESS
+          - REVOKE_ACCESS
+          - RECONCILE_DELIVERY
+          - RECONCILE_REVOCATION
+          - RECOVERY_VERIFICATION
+          - HEALTH_CHECK
+        status:
+          type: string
+          enum:
+          - QUEUED
+          - LEASED
+          - RUNNING
+          - SUCCEEDED
+          - FAILED
+          - RETRY_WAIT
+          - RECONCILING
+          - CANCELLED
+          - DEAD_LETTER
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 4
+        account_id:
+          type: string
+          format: uuid
+        profile_id:
+          type: string
+          format: uuid
+        order_id:
+          type: string
+          format: uuid
+        rental_id:
+          type: string
+          format: uuid
+        attempt:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        deadline_at:
+          type: string
+          format: date-time
+        payload:
+          type: object
+          additionalProperties: true
+    JobCreate:
+      type: object
+      required:
+      - type
+      - reason
+      properties:
+        type:
+          $ref: '#/components/schemas/Job/properties/type'
+        account_id:
+          type: string
+          format: uuid
+        profile_id:
+          type: string
+          format: uuid
+        order_id:
+          type: string
+          format: uuid
+        rental_id:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          minLength: 3
+        requested_priority:
+          type: integer
+          minimum: 1
+          maximum: 4
+    ClaimRequest:
+      type: object
+      required:
+      - worker_id
+      - capabilities
+      properties:
+        worker_id:
+          type: string
+          maxLength: 128
+        capabilities:
+          type: array
+          items:
+            type: string
+        max_jobs:
+          type: integer
+          minimum: 1
+          maximum: 1
+          default: 1
+    ClaimResponse:
+      type: object
+      required:
+      - job
+      - lease_token
+      - fencing_token
+      - lease_expires_at
+      properties:
+        job:
+          $ref: '#/components/schemas/Job'
+        lease_token:
+          type: string
+          description: Opaque secret, never log
+        fencing_token:
+          type: integer
+          format: int64
+        lease_expires_at:
+          type: string
+          format: date-time
+        execution_context:
+          type: object
+          description: Minimal non-secret scoped metadata
+          additionalProperties: true
+    Heartbeat:
+      type: object
+      required:
+      - lease_token
+      - fencing_token
+      - worker_id
+      properties:
+        lease_token:
+          type: string
+        fencing_token:
+          type: integer
+          format: int64
+        worker_id:
+          type: string
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+    Evidence:
+      type: object
+      required:
+      - kind
+      - reference
+      - observed_at
+      - source
+      properties:
+        kind:
+          type: string
+          enum:
+          - MOCK
+          - MANUAL
+          - AUTHORIZED_PROVIDER
+        reference:
+          type: string
+          description: Evidence ID / safe URI; no secrets
+        observed_at:
+          type: string
+          format: date-time
+        source:
+          type: string
+        checksum_sha256:
+          type: string
+    JobResult:
+      type: object
+      required:
+      - lease_token
+      - fencing_token
+      - worker_id
+      - outcome
+      - observed_at
+      - evidence
+      properties:
+        lease_token:
+          type: string
+        fencing_token:
+          type: integer
+          format: int64
+        worker_id:
+          type: string
+        outcome:
+          type: string
+          enum:
+          - PASS
+          - FAIL
+          - INCONCLUSIVE
+        observed_at:
+          type: string
+          format: date-time
+        evidence:
+          $ref: '#/components/schemas/Evidence'
+        checks:
+          type: object
+          properties:
+            login:
+              type: string
+              enum:
+              - PASS
+              - FAIL
+              - UNKNOWN
+            subscription:
+              type: string
+              enum:
+              - PASS
+              - FAIL
+              - UNKNOWN
+            profile_readiness:
+              type: string
+              enum:
+              - PASS
+              - FAIL
+              - UNKNOWN
+        subscription_expires_at:
+          type: string
+          format: date-time
+        delivery_occurred_at:
+          type: string
+          format: date-time
+        access_revoked_at:
+          type: string
+          format: date-time
+        error_code:
+          type: string
+          enum:
+          - ACCOUNT_LOCKED
+          - SUBSCRIPTION_INVALID
+          - TIMEOUT
+          - NETWORK_ERROR
+          - ACCESS_NOT_REVOKED
+          - DELIVERY_UNCERTAIN
+          - UNSUPPORTED_PROVIDER
+          - UNKNOWN
+        notes:
+          type: string
+          maxLength: 2000
+    CancelRequest:
+      type: object
+      required:
+      - reason
+      properties:
+        reason:
+          type: string
+          minLength: 3
+    JobEvent:
+      type: object
+      required:
+      - event_id
+      - event_type
+      - occurred_at
+      - store_id
+      - job_id
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          enum:
+          - job.queued
+          - job.claimed
+          - job.started
+          - job.retry_scheduled
+          - job.succeeded
+          - job.failed
+          - job.reconciling
+          - job.cancelled
+          - incident.opened
+          - incident.updated
+        occurred_at:
+          type: string
+          format: date-time
+        store_id:
+          type: string
+          format: uuid
+        job_id:
+          type: string
+          format: uuid
+        data:
+          type: object
+          additionalProperties: true

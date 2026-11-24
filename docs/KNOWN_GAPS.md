@@ -1,0 +1,10 @@
+# Known gaps
+
+- **Identity and store governance.** Invite/reset/email-change token workflows, staff lifecycle and history, owner transfer, store closure and obligation snapshots, suspension and recovery procedures.
+- **Production financial controls.** Manual verification, verified real payment registry, banking account exclusivity, compensation credit, atomic balance projection, source allocation/restoration, refund holds, refunds, immutable linked reversals and reconciliation. The current ledger records disposable mock credits and purchases only.
+- **Inventory, rental and billing.** Encrypted credentials, account lifecycle, configurable verification policies, inventory holds, renewal/cancellation, automated maintenance scheduling, incident handling beyond recorded events, SaaS billing and ledger, reporting, retention and legal hold.
+- **Worker policy.** PostgreSQL-backed leasing and bounded retries run when a worker polls. Dedicated scheduler, global cross-store priority, worker OAuth2 or mTLS, worker endpoint rate limiting, richer eligibility and incident policies, operational token rotation, Swagger UI and independent bot-team approval are outstanding. Do not point the demo worker at other services.
+- **Tenant privilege split.** The API verifies session or worker proof before setting transaction context and RLS independently verifies scoped proof. The shared runtime DB role still has broad control-plane privileges. Split database roles and tighten table/function grants before release.
+- **Release gates.** Comprehensive DB-01–DB-100 acceptance, coverage thresholds, browser coverage for all roles, SQL performance and load testing, automated backups and PITR, security scans beyond dependency audit, and independent professional pentest remain outstanding. Production-mode startup is blocked.
+- **Deferred by specification.** DB-31, customer login, outbound email and live banking/streaming integrations.
+

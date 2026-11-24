@@ -1,0 +1,3 @@
+CODEX_MASTER_PROMPT_STREAMING_SAAS_V4_WITH_BOT_API.md -text
+contracts/openapi.bot-control.v1.yaml -text
+database/migrations/*.sql text eol=lf

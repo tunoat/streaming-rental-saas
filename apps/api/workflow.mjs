@@ -1,0 +1,354 @@
+import { emailAddress, membership, passwordHash, reject } from './db.mjs';
+import { enqueue, uuid } from './jobs.mjs';
+
+const protectedJobs=['DELIVER_ACCESS','REVOKE_ACCESS','RECONCILE_DELIVERY','RECONCILE_REVOCATION'];
+export async function validateTarget(q,store,b) {
+  if (protectedJobs.includes(b.type)) reject(409,'USE_WORKFLOW_ACTION');
+  if (b.order_id || b.rental_id) reject(400,'INVALID_TARGET');
+  if (!b.account_id && b.type!=='HEALTH_CHECK') reject(400,'ACCOUNT_REQUIRED');
+  if (b.account_id) {
+    const {rows:[account]}=await q('SELECT health FROM accounts WHERE store_id=$1 AND id=$2',[store,b.account_id]);
+    if (!account) reject(400,'INVALID_TARGET');
+    if (account.health==='BLOCKED' && b.type!=='RECOVERY_VERIFICATION') reject(409,'ACCOUNT_BLOCKED');
+  }
+  if (b.profile_id) {
+    const found=await q('SELECT 1 FROM profiles WHERE store_id=$1 AND id=$2 AND account_id=$3 AND archived_at IS NULL',[store,b.profile_id,b.account_id]);
+    if (!found.rowCount) reject(400,'INVALID_TARGET');
+  }
+}
+
+export async function applyEvidence(q,job,b) {
+  const {store_id:store,account_id:account,order_id:order,profile_id:profile,rental_id:rental}=job;
+  if (account && ['ACCOUNT_LOCKED','SUBSCRIPTION_INVALID'].includes(b.error_code) && b.outcome!=='PASS') {
+    await q("UPDATE accounts SET health='BLOCKED',blocked_at=clock_timestamp(),checked_at=NULL,subscription_until=NULL WHERE store_id=$1 AND id=$2",[store,account]);
+  }
+  if (b.outcome!=='PASS') return;
+  if (account && ['HEALTH_CHECK','VERIFY_SUBSCRIPTION','RECOVERY_VERIFICATION'].includes(job.type)) {
+    const changed=await q(`UPDATE accounts SET health='HEALTHY',checked_at=$3,subscription_until=$4
+      WHERE store_id=$1 AND id=$2 AND (health<>'BLOCKED' OR
+        ($5='RECOVERY_VERIFICATION' AND $3>=blocked_at AND $3>=clock_timestamp()-interval '15 minutes'))
+      AND (checked_at IS NULL OR checked_at<=$3)`,[store,account,b.observed_at,b.subscription_expires_at,job.type]);
+    if (!changed.rowCount) reject(409,'STALE_EVIDENCE');
+  }
+  if (['DELIVER_ACCESS','RECONCILE_DELIVERY'].includes(job.type)) {
+    const {rows:[orderRow]}=await q(`SELECT o.days,a.subscription_until FROM orders o
+      JOIN profiles p ON p.store_id=o.store_id AND p.id=o.profile_id
+      JOIN accounts a ON a.store_id=p.store_id AND a.id=p.account_id
+      WHERE o.store_id=$1 AND o.id=$2 AND o.profile_id=$3 AND o.status='DELIVERING'
+      AND p.status IN ('RESERVED','HELD') AND a.health='HEALTHY' AND a.checked_at>now()-interval '24 hours'`,
+      [store,order,profile]);
+    if (!orderRow || orderRow.subscription_until.getTime()<Date.parse(b.delivery_occurred_at)+orderRow.days*86400000) reject(409,'DELIVERY_NOT_ELIGIBLE');
+    await q(`INSERT INTO rentals(store_id,order_id,profile_id,starts_at,ends_at)
+      VALUES($1,$2,$3,$4::timestamptz,$4::timestamptz+$5*interval '24 hours')`,[store,order,profile,b.delivery_occurred_at,orderRow.days]);
+    await q("UPDATE profiles SET status='OCCUPIED' WHERE store_id=$1 AND id=$2",[store,profile]);
+    await q("UPDATE orders SET status='FULFILLED' WHERE store_id=$1 AND id=$2",[store,order]);
+  }
+  if (['REVOKE_ACCESS','RECONCILE_REVOCATION'].includes(job.type)) {
+    const closed=await q("UPDATE rentals SET status='CLOSED' WHERE store_id=$1 AND id=$2 AND status='REVOCATION_PENDING' AND ends_at<=$3",
+      [store,rental,b.access_revoked_at]);
+    if (!closed.rowCount) reject(409,'REVOCATION_NOT_ELIGIBLE');
+    await q("UPDATE profiles SET status='AVAILABLE' WHERE store_id=$1 AND id=$2",[store,profile]);
+  }
+  if (job.reconciles_id) await q("UPDATE jobs SET status='SUCCEEDED' WHERE store_id=$1 AND id=$2 AND status='RECONCILING'",[store,job.reconciles_id]);
+}
+
+const validId = v => {
+  if (!uuid.test(v??'')) reject(400,'INVALID_ID');
+  return v;
+};
+const shortText = v => {
+  if (typeof v!=='string' || !v.trim() || v.length>150) reject(400,'INVALID_INPUT');
+  return v.trim();
+};
+function customerUrl(value) {
+  if (value===undefined || value===null || value==='') return null;
+  if (typeof value!=='string' || value.length>2048) reject(400,'INVALID_CUSTOMER_URL');
+  const input=value.trim();
+  if (!input) return null;
+  const url=URL.canParse(input)?new URL(input):null;
+  if (!url || !['https:','http:'].includes(url.protocol) || !/^https?:\/\//i.test(input) ||
+      url.username || url.password || url.href.length>2048) reject(400,'INVALID_CUSTOMER_URL');
+  return url.href;
+}
+const customerAlias=value=>value==null || (typeof value==='string' && !value.trim())?null:shortText(value);
+const money = v => {
+  if (typeof v!=='string' || !/^(?:0|[1-9][0-9]{0,15})(?:\.[0-9]{1,2})?$/.test(v) || Number(v)<=0) reject(400,'INVALID_AMOUNT');
+  return v;
+};
+const streamingPlatform = value => {
+  const platform=shortText(value).toLowerCase();
+  if (platform!=='netflix') reject(400,'UNSUPPORTED_STREAMING_PLATFORM');
+  return platform;
+};
+const duration = value => {
+  if (!Number.isInteger(value) || value<1 || value>365) reject(400,'INVALID_DURATION');
+  return value;
+};
+const availableProfile="p.status='AVAILABLE' AND p.archived_at IS NULL";
+const eligibleOrder=`o.store_id=a.store_id AND o.status='PAID_WAITING' AND a.health='HEALTHY'
+  AND (o.platform IS NULL OR a.platform=o.platform)
+  AND a.checked_at>now()-interval '24 hours' AND a.subscription_until>=now()+(o.days*interval '24 hours')`;
+const entities = {
+  customers:'SELECT c.id,c.name,c.alias,c.url,COALESCE(sum(l.amount),0)::numeric(18,2) AS balance FROM customers c LEFT JOIN wallet_ledger l ON c.store_id=l.store_id AND c.id=l.customer_id WHERE c.store_id=$1 GROUP BY c.store_id,c.id ORDER BY c.name LIMIT 100',
+  accounts:'SELECT id,platform,email,health,subscription_until FROM accounts WHERE store_id=$1 ORDER BY platform,email LIMIT 100',
+  'streaming-emails':`SELECT e.id,e.email,e.password_hash IS NOT NULL AS password_set,coalesce(array_agg(a.platform ORDER BY a.platform)
+    FILTER (WHERE a.id IS NOT NULL),ARRAY[]::text[]) AS bound_platforms
+    FROM streaming_email_addresses e LEFT JOIN accounts a ON (a.store_id,a.email)=(e.store_id,e.email)
+    WHERE e.store_id=$1 GROUP BY e.store_id,e.id ORDER BY e.email`,
+  profiles:`SELECT id,account_id,label,status,pin_hash IS NOT NULL AS pin_set FROM profiles
+    WHERE store_id=$1 AND archived_at IS NULL ORDER BY account_id,length(label),label,id`,
+  'payment-requests':'SELECT id,customer_id,amount,status FROM payment_requests WHERE store_id=$1 LIMIT 100',
+  transfers:'SELECT id,payment_id,amount,approved_at FROM transfers WHERE store_id=$1 LIMIT 100',
+  packages:'SELECT id,platform,name,days,amount FROM streaming_packages WHERE store_id=$1 ORDER BY platform,days,name,id',
+  rentals:`SELECT r.id,r.order_id,r.starts_at,r.ends_at,r.status,o.package_id,o.customer_id FROM rentals r
+    JOIN orders o ON o.store_id=r.store_id AND o.id=r.order_id WHERE r.store_id=$1 ORDER BY r.ends_at LIMIT 100`,
+  incidents:'SELECT id,job_id,reason,created_at FROM incidents WHERE store_id=$1 ORDER BY created_at DESC LIMIT 100'
+};
+export function registerWorkflow(secured) {
+  const register=(method,path,handler,{owner=false,sale=false}={})=>secured(method,'/v1/stores/:storeId/'+path,async(q,auth,req)=>{
+    const store=validId(req.params.storeId);
+    req.storeRole=await membership(q,auth,store,owner?['OWNER']:undefined);
+    if (method==='POST') await q('SELECT pg_advisory_xact_lock(hashtextextended($1,1))',[store]);
+    if (sale) {
+      const {rows:[open]}=await q("SELECT plan FROM stores WHERE id=$1 AND status='ACTIVE' AND expires_at>now()",[store]);
+      if (!open) reject(409,'STORE_NOT_OPEN_FOR_SALES');
+      req.plan=open.plan;
+    }
+    return handler(q,store,req.body??{},req,auth);
+  });
+  for (const [path,sql] of Object.entries(entities)) {
+    register('GET',path,async(q,s)=>(await q(sql,[s])).rows,{owner:['payment-requests','transfers','customers'].includes(path)});
+  }
+  register('GET','orders',async(q,s,b,req)=>(await q(`SELECT id,customer_id,amount,days,status,package_id,platform,kind,rental_id,reason
+    FROM orders WHERE store_id=$1 AND (NOT $2::boolean OR status IN ('PAID_WAITING','DELIVERING'))
+    ORDER BY created_at,id LIMIT 100`,[s,req.query.scope==='active'])).rows);
+  register('GET','owner-overview',async(q,s)=>(await q(`
+    WITH backlog AS (
+      SELECT o.platform,o.days,COALESCE(p.name,'ออเดอร์เดิม') AS name,
+        count(*) FILTER (WHERE o.status='PAID_WAITING')::int AS waiting,
+        count(*) FILTER (WHERE o.status='DELIVERING')::int AS delivering
+      FROM orders o LEFT JOIN streaming_packages p ON (p.store_id,p.id)=(o.store_id,o.package_id)
+      WHERE o.store_id=$1 AND o.status IN ('PAID_WAITING','DELIVERING')
+      GROUP BY o.platform,o.package_id,o.days,p.name
+    )
+    SELECT
+      COALESCE((SELECT jsonb_agg(to_jsonb(backlog) ORDER BY platform,days,name) FROM backlog),'[]'::jsonb) AS backlog,
+      (SELECT count(*)::int FROM rentals WHERE store_id=$1 AND status='ACTIVE'
+        AND ends_at>now() AND ends_at<=now()+interval '72 hours') AS expiring,
+      (SELECT count(*)::int FROM transfers WHERE store_id=$1 AND approved_at IS NULL) AS payments_pending,
+      (SELECT count(*)::int FROM incidents WHERE store_id=$1) AS incident_count,
+      (SELECT COALESCE(sum(amount),0.00)::text FROM wallet_ledger WHERE store_id=$1 AND transfer_id IS NOT NULL) AS credits_in,
+      public.store_sales_summary($1) AS sales,
+      jsonb_build_object(
+        'packages',EXISTS (SELECT 1 FROM streaming_packages WHERE store_id=$1),
+        'accounts',EXISTS (SELECT 1 FROM accounts WHERE store_id=$1 AND health='HEALTHY'),
+        'profiles',EXISTS (SELECT 1 FROM profiles WHERE store_id=$1 AND archived_at IS NULL),
+        'customers',EXISTS (SELECT 1 FROM customers WHERE store_id=$1),
+        'rentals',EXISTS (SELECT 1 FROM rentals WHERE store_id=$1)
+      ) AS setup`,[s])).rows[0],{owner:true});
+  register('GET','customer-renewals',async(q,s,b,req)=>(await q(`
+    SELECT c.id,c.name,c.alias,c.url,COALESCE(current_rentals.items,'[]'::jsonb) AS rentals
+      ${req.storeRole==='OWNER'?',(SELECT COALESCE(sum(l.amount),0)::numeric(18,2) FROM wallet_ledger l WHERE (l.store_id,l.customer_id)=(c.store_id,c.id)) AS balance':''}
+    FROM customers c
+    LEFT JOIN LATERAL (
+      SELECT jsonb_agg(jsonb_build_object('id',r.id,'ends_at',r.ends_at,'platform',a.platform,
+        'account_email',a.email,'profile_label',p.label,'package_name',k.name,'package_days',o.days)
+        ORDER BY r.ends_at,r.id) AS items,min(r.ends_at) FILTER (WHERE r.ends_at>now()) AS next_expiry
+      FROM orders o JOIN rentals r ON (r.store_id,r.order_id)=(o.store_id,o.id)
+      JOIN profiles p ON (p.store_id,p.id)=(r.store_id,r.profile_id)
+      JOIN accounts a ON (a.store_id,a.id)=(p.store_id,p.account_id)
+      LEFT JOIN streaming_packages k ON (k.store_id,k.id)=(o.store_id,o.package_id)
+      WHERE (o.store_id,o.customer_id)=(c.store_id,c.id) AND r.status IN ('ACTIVE','REVOCATION_PENDING')
+    ) current_rentals ON true
+    WHERE c.store_id=$1
+    ORDER BY current_rentals.next_expiry NULLS LAST,c.name,c.id LIMIT 100`,[s])).rows);
+  const insert=async(q,sql,args)=>(await q(sql,args)).rows[0];
+  async function packageQuote(q,store,id,body) {
+    const amount=money(body.amount), days=duration(body.days);
+    const {rows:[selected]}=await q(`SELECT platform,amount=$3::numeric AND days=$4 AS matches
+      FROM streaming_packages WHERE store_id=$1 AND id=$2`,[store,id,amount,days]);
+    if (!selected) reject(404,'NOT_FOUND');
+    if (!selected.matches) reject(409,'PACKAGE_PRICE_CHANGED');
+    return {amount,days,platform:selected.platform};
+  }
+  async function assertCredit(q,store,customer,amount) {
+    const {rows:[{eligible}]}=await q('SELECT COALESCE(sum(amount),0)>=$3::numeric AS eligible FROM wallet_ledger WHERE store_id=$1 AND customer_id=$2',[store,customer,amount]);
+    if (!eligible) reject(409,'INSUFFICIENT_CREDIT');
+  }
+  const debit=(q,store,customer,order,amount)=>q(
+    'INSERT INTO wallet_ledger(store_id,customer_id,order_id,amount) VALUES($1,$2,$3,-$4::numeric)',[store,customer,order,amount]);
+  register('POST','packages',(q,s,b)=>insert(q,`INSERT INTO streaming_packages(store_id,platform,name,days,amount)
+    VALUES($1,$2,$3,$4,$5) RETURNING id,platform,name,days,amount`,
+    [s,streamingPlatform(b.platform),shortText(b.name),duration(b.days),money(b.amount)]),{owner:true,sale:true});
+  register('POST','packages/:packageId',async(q,s,b,req)=>{
+    const {rows:[entry]}=await q(`UPDATE streaming_packages SET name=$3,days=$4,amount=$5
+      WHERE store_id=$1 AND id=$2 RETURNING id,platform,name,days,amount`,
+      [s,req.params.packageId,shortText(b.name),duration(b.days),money(b.amount)]);
+    if (!entry) reject(404,'NOT_FOUND');
+    return entry;
+  },{owner:true,sale:true});
+  register('POST','customers',(q,s,b)=>insert(q,'INSERT INTO customers(store_id,name,alias,url) VALUES($1,$2,$3,$4) RETURNING id,name,alias,url',
+    [s,shortText(b.name),customerAlias(b.alias),customerUrl(b.url)]),{sale:true});
+  register('POST','customers/:customerId/contact',async(q,s,b,req)=>{
+    const {rows:[customer]}=await q('UPDATE customers SET alias=$3,url=$4 WHERE store_id=$1 AND id=$2 RETURNING id,name,alias,url',
+      [s,req.params.customerId,customerAlias(b.alias),customerUrl(b.url)]);
+    if(!customer) reject(404,'NOT_FOUND');
+    return customer;
+  },{owner:true});
+  register('POST','streaming-emails',async(q,s,b)=>insert(q,`INSERT INTO streaming_email_addresses(store_id,email,password_hash)
+    VALUES($1,$2,$3) RETURNING id,email,true AS password_set`,
+    [s,emailAddress(b.email),await passwordHash(b.password)]),{owner:true,sale:true});
+  register('POST','streaming-emails/:emailId',async(q,s,b,{params:{emailId}})=>{
+    const {rows:[entry]}=await q(`SELECT e.email,EXISTS (SELECT 1 FROM accounts a WHERE (a.store_id,a.email)=(e.store_id,e.email)) AS bound
+      FROM streaming_email_addresses e
+      WHERE e.store_id=$1 AND e.id=$2`,[s,emailId]);
+    if (!entry) reject(404,'NOT_FOUND');
+    const email=b.email===undefined?entry.email:emailAddress(b.email);
+    if (entry.bound&&email!==entry.email) reject(409,'STREAMING_EMAIL_BOUND');
+    const hash=b.password===undefined||b.password===''?null:await passwordHash(b.password);
+    return insert(q,`UPDATE streaming_email_addresses SET email=$3,password_hash=COALESCE($4,password_hash)
+      WHERE store_id=$1 AND id=$2 RETURNING id,email,password_hash IS NOT NULL AS password_set`,[s,emailId,email,hash]);
+  },{owner:true});
+  register('POST','accounts',async(q,s,b,req)=>{
+    if (b.otp!=='123456') reject(400,'MOCK_BIND_INVALID');
+    const platform=streamingPlatform(b.platform);
+    const profileCount=b.profile_count===undefined?5:b.profile_count;
+    if (!Number.isInteger(profileCount) || profileCount<1 || profileCount>100)
+      reject(400,'INVALID_PROFILE_COUNT');
+    const {rows:[credential]}=await q(`SELECT email,password_hash IS NOT NULL AS password_set FROM streaming_email_addresses
+      WHERE store_id=$1 AND id=$2`,[s,validId(b.email_id)]);
+    if (!credential?.password_set) reject(400,'STREAMING_EMAIL_PASSWORD_REQUIRED');
+    const {email}=credential;
+    const {rows:[{count}]}=await q('SELECT count(DISTINCT email)::int AS count FROM accounts WHERE store_id=$1 AND email<>$2',[s,email]);
+    if (count>=({STARTER:20,PRO:100,BUSINESS:200})[req.plan]) reject(409,'EMAIL_QUOTA');
+    await q('INSERT INTO streaming_emails(store_id,platform,email) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',[s,platform,email]);
+    const account=await insert(q,'INSERT INTO accounts(store_id,platform,email) VALUES($1,$2,$3) RETURNING id',[s,platform,email]);
+    await q(`INSERT INTO profiles(store_id,account_id,label)
+      SELECT $1,$2,'profile'||number FROM generate_series(1,$3::integer) AS series(number)`,[s,account.id,profileCount]);
+    return account;
+  },{sale:true});
+  register('POST','profiles',(q,s,b)=>insert(q,'INSERT INTO profiles(store_id,account_id,label) VALUES($1,$2,$3) RETURNING id',
+    [s,validId(b.account_id),shortText(b.label)]),{sale:true});
+  const profilePath='accounts/:accountId/profiles/:profileId/';
+  register('POST',profilePath+'rename',async(q,s,b,{params:{accountId,profileId}})=>{
+    const {rows:[profile]}=await q(`UPDATE profiles SET label=$4
+      WHERE store_id=$1 AND account_id=$2 AND id=$3 AND archived_at IS NULL RETURNING id,label`,
+      [s,accountId,profileId,shortText(b.label)]);
+    if (!profile) reject(404,'NOT_FOUND');
+    return profile;
+  },{owner:true});
+  register('POST',profilePath+'pin',async(q,s,b,{params:{accountId,profileId}})=>{
+    if (typeof b.pin!=='string'||!/^\d{4}$/.test(b.pin)) reject(400,'INVALID_PROFILE_PIN');
+    const target=await q(`SELECT status FROM profiles WHERE store_id=$1 AND account_id=$2 AND id=$3 AND archived_at IS NULL`,
+      [s,accountId,profileId]);
+    if (!target.rowCount) reject(404,'NOT_FOUND');
+    if (target.rows[0].status!=='AVAILABLE') reject(409,'PROFILE_IN_USE');
+    await q('UPDATE profiles SET pin_hash=$4 WHERE store_id=$1 AND account_id=$2 AND id=$3',
+      [s,accountId,profileId,await passwordHash('streaming-profile-pin:'+b.pin)]);
+    return {pin_set:true};
+  },{owner:true});
+  register('POST',profilePath+'archive',async(q,s,b,{params:{accountId,profileId}})=>{
+    if (b.confirm!==true) reject(400,'CONFIRM_REQUIRED');
+    const target=await q(`SELECT p.status,EXISTS (SELECT 1 FROM jobs j WHERE j.store_id=p.store_id AND j.profile_id=p.id
+      AND j.status IN ('QUEUED','LEASED','RUNNING','RETRY_WAIT','RECONCILING')) AS pending
+      FROM profiles p WHERE p.store_id=$1 AND p.account_id=$2 AND p.id=$3 AND p.archived_at IS NULL`,[s,accountId,profileId]);
+    if (!target.rowCount) reject(404,'NOT_FOUND');
+    if (target.rows[0].status!=='AVAILABLE'||target.rows[0].pending) reject(409,'PROFILE_IN_USE');
+    await q('UPDATE profiles SET archived_at=now(),pin_hash=NULL WHERE store_id=$1 AND account_id=$2 AND id=$3',[s,accountId,profileId]);
+    return {ok:true};
+  },{owner:true});
+  register('POST','payment-requests',(q,s,b)=>insert(q,'INSERT INTO payment_requests(store_id,customer_id,amount) VALUES($1,$2,$3) RETURNING id',
+    [s,validId(b.customer_id),money(b.amount)]),{sale:true,owner:true});
+  register('POST','transfers',(q,s,b)=>{
+    if (!/^mock-[a-zA-Z0-9_-]{3,100}$/.test(b.evidence??'')) reject(400,'MOCK_EVIDENCE_REQUIRED');
+    return insert(q,'INSERT INTO transfers(store_id,payment_id,amount,evidence) VALUES($1,$2,$3,$4) RETURNING id',
+      [s,validId(b.payment_id),money(b.amount),b.evidence]);
+  },{owner:true});
+  register('POST','transfers/:id/approve',async(q,s,b,req)=>{
+    if (b.confirm!==true) reject(400,'CONFIRM_REQUIRED');
+    const id=validId(req.params.id);
+    const {rows:[transfer]}=await q(`SELECT t.approved_at,t.amount,p.customer_id FROM transfers t
+      JOIN payment_requests p ON p.store_id=t.store_id AND p.id=t.payment_id WHERE t.store_id=$1 AND t.id=$2`,[s,id]);
+    if (!transfer) reject(404,'NOT_FOUND');
+    if (!transfer.approved_at) {
+      await q('INSERT INTO wallet_ledger(store_id,customer_id,transfer_id,amount) VALUES($1,$2,$3,$4)',[s,transfer.customer_id,id,transfer.amount]);
+      await q('UPDATE transfers SET approved_at=now() WHERE store_id=$1 AND id=$2',[s,id]);
+    }
+    return {ok:true};
+  },{owner:true});
+  register('POST','orders',async(q,s,b)=>{
+    if (b.confirm!==true) reject(400,'CONFIRM_REQUIRED');
+    const customer=validId(b.customer_id), packageId=validId(b.package_id);
+    const {amount,days,platform}=await packageQuote(q,s,packageId,b);
+    await assertCredit(q,s,customer,amount);
+    const order=await insert(q,'INSERT INTO orders(store_id,customer_id,amount,days,package_id,platform) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,status',
+      [s,customer,amount,days,packageId,platform]);
+    await debit(q,s,customer,order.id,amount);
+    return order;
+  },{sale:true});
+  for (const [action,kind] of [['renew','RENEWAL'],['compensate','COMPENSATION']]) {
+    const renewal=kind==='RENEWAL';
+    register('POST','rentals/:rentalId/'+action,async(q,s,b,req,auth)=>{
+      if (b.confirm!==true) reject(400,'CONFIRM_REQUIRED');
+      const id=req.params.rentalId;
+      const {rows:[rental]}=await q(`SELECT r.ends_at,r.status,r.profile_id,o.customer_id,o.package_id
+        FROM rentals r JOIN orders o ON (o.store_id,o.id)=(r.store_id,r.order_id)
+        WHERE r.store_id=$1 AND r.id=$2`,[s,id]);
+      if (!rental) reject(404,'NOT_FOUND');
+      if (rental.ends_at.toISOString()!==b.expected_ends_at) reject(409,'RENTAL_CHANGED');
+      if (renewal && (!rental.package_id || rental.package_id!==b.package_id)) reject(409,'ORIGINAL_PACKAGE_REQUIRED');
+      const terms=renewal?await packageQuote(q,s,rental.package_id,b):{amount:'0',days:duration(b.days),platform:null};
+      const reason=renewal?null:shortText(b.reason);
+      const {amount,days,platform}=terms;
+      if (renewal) await assertCredit(q,s,rental.customer_id,amount);
+      const extension=await q(`UPDATE rentals r SET ends_at=r.ends_at+$3::integer*interval '24 hours'
+        FROM profiles p JOIN accounts a ON (a.store_id,a.id)=(p.store_id,p.account_id)
+        WHERE r.store_id=$1 AND r.id=$2 AND (p.store_id,p.id)=(r.store_id,r.profile_id)
+        AND r.status='ACTIVE' AND r.ends_at>clock_timestamp() AND p.status='OCCUPIED'
+        AND a.health='HEALTHY' AND a.checked_at>clock_timestamp()-interval '24 hours'
+        AND a.subscription_until>=r.ends_at+$3::integer*interval '24 hours'
+        RETURNING r.ends_at`,[s,id,days]);
+      if (!extension.rowCount) reject(409,'RENTAL_EXTENSION_UNAVAILABLE');
+      const order=await insert(q,`INSERT INTO orders(store_id,customer_id,profile_id,amount,days,package_id,platform,status,kind,rental_id,reason,actor_id)
+        VALUES($1,$2,$3,$4,$5,$6,$7,'FULFILLED',$8,$9,$10,$11) RETURNING id,kind`,
+        [s,rental.customer_id,rental.profile_id,amount,days,renewal?rental.package_id:null,platform,kind,id,reason,auth.id]);
+      if (renewal) await debit(q,s,rental.customer_id,order.id,amount);
+      return {...order,ends_at:extension.rows[0].ends_at};
+    },{owner:true,sale:renewal});
+  }
+  register('GET','allocation-accounts',async(q,s,b,req)=>{
+    const orderId=req.query.order_id===undefined?null:validId(req.query.order_id);
+    let platform=null;
+    if(orderId){
+      const {rows:[order]}=await q("SELECT platform FROM orders WHERE store_id=$1 AND id=$2 AND status='PAID_WAITING'",[s,orderId]);
+      if(!order) reject(404,'WAITING_ORDER_NOT_FOUND');
+      platform=order.platform;
+    }
+    return (await q(`SELECT a.id,a.platform,a.email,a.health,count(p.id)::int AS available_profiles,
+      EXISTS (SELECT 1 FROM orders o WHERE ${eligibleOrder} AND ($2::uuid IS NULL OR o.id=$2)) AS accepts_waiting_order
+      FROM accounts a LEFT JOIN profiles p ON (p.store_id,p.account_id)=(a.store_id,a.id) AND ${availableProfile}
+      WHERE a.store_id=$1 AND ($3::text IS NULL OR a.platform=$3)
+      GROUP BY a.store_id,a.id ORDER BY a.platform,a.email,a.id`,[s,orderId,platform])).rows;
+  });
+  register('POST','allocate',async(q,s,b,req,auth)=>{
+    const account=b.account_id===undefined?null:validId(b.account_id);
+    const orderId=b.order_id===undefined?null:validId(b.order_id);
+    const {rows:[candidate]}=await q(`SELECT o.id AS order_id,p.id AS profile_id,p.account_id FROM orders o
+      JOIN profiles p ON p.store_id=o.store_id AND ${availableProfile}
+      JOIN accounts a ON a.store_id=p.store_id AND a.id=p.account_id
+      WHERE o.store_id=$1 AND ($2::uuid IS NULL OR a.id=$2) AND ($3::uuid IS NULL OR o.id=$3) AND ${eligibleOrder}
+      ORDER BY o.created_at,o.id,p.id LIMIT 1`,[s,account,orderId]);
+    if (!candidate) reject(409,'NO_ELIGIBLE_ALLOCATION');
+    await q("UPDATE profiles SET status='RESERVED' WHERE store_id=$1 AND id=$2",[s,candidate.profile_id]);
+    await q("UPDATE orders SET status='DELIVERING',profile_id=$3 WHERE store_id=$1 AND id=$2",[s,candidate.order_id,candidate.profile_id]);
+    const job=await enqueue(q,s,{...candidate,type:'DELIVER_ACCESS'},auth.id,req.id);
+    return {job_id:job.id};
+  });
+  register('POST','rentals/expire',async(q,s,b,req,auth)=>{
+    const {rows}=await q(`UPDATE rentals SET status='REVOCATION_PENDING' WHERE store_id=$1 AND status='ACTIVE' AND ends_at<=now()
+      RETURNING id,profile_id,order_id`,[s]);
+    for (const row of rows) await enqueue(q,s,{...row,rental_id:row.id,type:'REVOKE_ACCESS'},auth.id,req.id);
+    return {queued:rows.length};
+  });
+}
+

@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: local_migration_only
+    ports:
+      - "127.0.0.1:${POSTGRES_LOCAL_PORT:-55432}:5432"
+    volumes:
+      - phase1:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+  migrate:
+    build: .
+    environment:
+      MIGRATION_DATABASE_URL: postgres://postgres:local_migration_only@postgres/postgres
+    command: ["npm", "run", "migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgres://stream_app:local_runtime_only@postgres/postgres
+      HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:${API_LOCAL_PORT:-3000}:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  mock-worker:
+    build: .
+    profiles: ["worker"]
+    environment:
+      BOT_API_URL: http://api:3000
+      BOT_WORKER_ID: ${BOT_WORKER_ID:-mock-local}
+      BOT_WORKER_TOKEN: ${BOT_WORKER_TOKEN:-}
+    command: ["npm", "run", "worker"]
+    depends_on:
+      - api
+volumes:
+  phase1:
+
