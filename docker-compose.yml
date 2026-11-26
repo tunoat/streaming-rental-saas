@@ -41,7 +41,18 @@ services:
     command: ["npm", "run", "worker"]
     depends_on:
       - api
-
+  gmail-test-worker:
+    build: .
+    profiles: ["gmail-test"]
+    environment:
+      GMAIL_ADAPTER: mock
+      BOT_API_URL: http://api:3000
+      BOT_WORKER_ID: ${GMAIL_WORKER_ID:-gmail-mock-local}
+      BOT_WORKER_TOKEN: ${GMAIL_WORKER_TOKEN:-}
+      GMAIL_WORKER_STORE_ID: ${GMAIL_WORKER_STORE_ID:-}
+    command: ["npm", "run", "gmail-worker"]
+    depends_on:
+      - api
 volumes:
   phase1:
 

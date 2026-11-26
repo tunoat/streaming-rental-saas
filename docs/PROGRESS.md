@@ -1,5 +1,7 @@
 # Phase 1 checkpoint
 
+Gmail Bot Module 01 adds Owner-only Gmail consent and bounded inbox verification in a separate worker namespace. Resume with [implementation findings](EMAIL_BOT_IMPLEMENTATION_PLAN.md), [Thai setup](EMAIL_BOT_SETUP.md) and the [English integration guide](EMAIL_BOT_INTEGRATION_GUIDE_EN.md). Live Google smoke verification is pending explicit test consent and credentials.
+
 | Milestone | State | Evidence |
 |---|---|---|
 | 0 | Done | Workspace inspected. Optional database archive absent. Part E and Part F exported. |

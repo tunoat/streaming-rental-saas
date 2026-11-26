@@ -108,6 +108,77 @@ async function request(path,body) {
   return data;
 }
 const shop=(path,body)=>request('stores/'+store+'/'+path,body);
+function gmailConnectionPanel(parent,emailId,current){
+  const section=element('section',undefined,parent);
+  element('h2','Gmail',section);
+  const content=element('div',undefined,section);
+  const path='email-addresses/'+emailId+'/';
+  const labels={NOT_CONNECTED:t('ยังไม่ได้เชื่อม Gmail'),AUTHORIZING:t('รออนุญาต Gmail'),VERIFYING:t('กำลังตรวจกล่องจดหมาย'),
+    CONNECTED:t('เชื่อม Gmail แล้ว'),AUTH_REQUIRED:t('ต้องอนุญาต Gmail ใหม่'),FAILED:t('ตรวจ Gmail ไม่สำเร็จ'),DISCONNECTED:t('ยกเลิกการเชื่อม Gmail แล้ว')};
+  const errors={AUTH_REQUIRED:labels.AUTH_REQUIRED,IDENTITY_MISMATCH:t('บัญชี Google ไม่ตรงกับอีเมลที่เลือก'),
+    IDENTITY_INVALID:t('ยืนยันตัวตน Google ไม่สำเร็จ'),SCOPE_INVALID:t('สิทธิ์อ่าน Gmail ไม่ครบ'),MODE_MISMATCH:t('โหมด Gmail เปลี่ยน กรุณาเชื่อมใหม่'),
+    PROVIDER_UNAVAILABLE:t('บริการ Gmail ไม่พร้อม กรุณาลองใหม่'),LEASE_EXPIRED:t('งานตรวจ Gmail หมดเวลา')};
+  let timer;
+  function schedule(attempt){
+    clearTimeout(timer);
+    if(attempt<16) timer=setTimeout(()=>load(attempt+1),Math.min(1000*2**attempt,5000));
+  }
+  async function load(attempt=0){
+    if(!current()) return;
+    try{
+      const state=await shop(path+'connection');
+      if(!current()) return;
+      clearTimeout(timer);
+      content.replaceChildren();
+      element('p',(state.mode==='mock'?t('โหมด Gmail จำลอง'):t('โหมด Gmail จริงสำหรับทดสอบ'))+' · '+labels[state.status],content);
+      if(state.last_verified_at) element('p',t('ตรวจล่าสุด ')+storeDate.format(new Date(state.last_verified_at)),content);
+      if(state.error) element('p',errors[state.error]??labels.FAILED,content);
+      if(state.status==='CONNECTED'&&state.evidence) element('p',t(state.evidence.empty_inbox?
+        'อ่านรายการกล่องจดหมายได้ กล่องจดหมายว่าง':'ตรวจข้อมูลกำกับอีเมลหนึ่งฉบับแล้ว'),content);
+      const pending=['AUTHORIZING','VERIFYING'].includes(state.status);
+      if(pending) schedule(attempt);
+      const connect=element('button',['NOT_CONNECTED','DISCONNECTED'].includes(state.status)?t('เชื่อม Gmail'):t('เชื่อม Gmail ใหม่'),content);
+      connect.disabled=pending;
+      connect.onclick=async()=>{
+        const popup=window.open('about:blank','_blank','popup,width=580,height=690');
+        if(!popup){notice(t('อนุญาตให้เปิดหน้าต่างเพื่อเชื่อม Gmail'));return;}
+        popup.opener=null;
+        connect.disabled=true;
+        try{
+          const result=await shop(path+'connections/gmail/authorize',{});
+          popup.location.replace(result.authorization_url);
+          await load();
+        }catch(error){popup.close();notice(error.message);connect.disabled=false;}
+      };
+      if(['CONNECTED','FAILED'].includes(state.status)){
+        const verify=element('button',t('ตรวจกล่องจดหมาย Gmail'),content);
+        verify.onclick=async()=>{
+          verify.disabled=true;
+          try{await shop(path+'connection/verify',{});await load();}catch(error){notice(error.message);verify.disabled=false;}
+        };
+      }
+      if(!['NOT_CONNECTED','DISCONNECTED'].includes(state.status)){
+        const disconnect=element('button',t('ยกเลิกการเชื่อม Gmail'),content);
+        disconnect.onclick=async()=>{
+          if(!window.confirm(t('ยืนยันยกเลิกการเชื่อม Gmail สำหรับอีเมลนี้'))) return;
+          disconnect.disabled=true;
+          try{
+            const result=await shop(path+'connection/disconnect',{confirm:true});
+            await load();
+            if(['SHARED_GRANT','UNCONFIRMED'].includes(result.remote_revocation)) notice(t('ยกเลิกในแอปแล้ว ยังไม่ได้เพิกถอนสิทธิ์ฝั่ง Google'));
+          }catch(error){notice(error.message);disconnect.disabled=false;}
+        };
+      }
+      if(pending&&attempt>=16){
+        const refresh=element('button',t('ดูสถานะ Gmail ล่าสุด'),content);
+        refresh.onclick=()=>load();
+      }
+    }catch(error){
+      if(current()){content.replaceChildren();element('p',error.message,content);}
+    }
+  }
+  load();
+}
 function list(rows,description,parent=view) {
   if(!rows.length) return element('p',t('ยังไม่มีรายการ'),parent);
   const ul=element('ul',undefined,parent);
@@ -766,6 +837,7 @@ async function render() {
         const back=element('button',t('กลับไปยังรายการอีเมล'));
         back.onclick=()=>{selectedStreamingEmail=undefined;render();};
         element('h2',details.email);
+        gmailConnectionPanel(view,selected.id,current);
         element('p',t('รหัสผ่านอีเมล')+' · '+(details.password??t(details.password_set?'ต้องตั้งรหัสผ่านอีเมลใหม่เพื่อให้ดูได้':'ยังไม่ได้ตั้งรหัสผ่านอีเมล')));
         element('h2',t('บัญชีที่ผูกแล้ว'));
         for(const account of details.accounts){
@@ -785,7 +857,7 @@ async function render() {
       element('p',t('เพิ่มอีเมลและรหัสผ่านสมมติไว้เลือกตอน Bind บัญชี'));
       form(t('เพิ่มอีเมลบัญชีสตรีมมิง'),[
         ['email',t('อีเมลบัญชีจำลอง'),'email'],
-        ['password',t('รหัสผ่านอีเมล'),{type:'password',minLength:12,maxLength:128,autocomplete:'new-password'}]
+        ['password',t('รหัสผ่านอีเมลจำลอง (ไม่บังคับ)'),{type:'password',required:false,minLength:12,maxLength:128,autocomplete:'new-password'}]
       ],data=>shop('streaming-emails',data),view,t('เพิ่มอีเมล'));
       for(const row of emails){
         const bound=row.bound_platforms.length>0;

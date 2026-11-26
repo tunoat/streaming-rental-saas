@@ -7,8 +7,9 @@ import { authenticate, pool, transaction } from './db.mjs';
 import { registerAdmin } from './admin.mjs';
 import { registerJobs, uuid } from './jobs.mjs';
 import { registerWorkflow } from './workflow.mjs';
+import { registerGmail } from './gmail.mjs';
 
-export async function appServer() {
+export async function appServer(gmailTest) {
   if (process.env.NODE_ENV==='production') throw new Error('The Phase 1 demo cannot run in production');
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL required');
   for (const [flag,allowed] of Object.entries({BANK_ADAPTER:'mock',STREAMING_ADAPTER:'mock',EMAIL_DELIVERY:'disabled',CUSTOMER_AUTH:'disabled'}))
@@ -40,6 +41,9 @@ export async function appServer() {
   registerAdmin(app,secured);
   registerJobs(secured);
   registerWorkflow(secured);
+  if(gmailTest&&process.env.NODE_ENV!=='test') throw new Error('Gmail injection is restricted to tests');
+  registerGmail(app,secured,gmailTest?.config,gmailTest?.provider);
+  app.get('/openapi.email-bot.v1.yaml',(_req,reply)=>reply.type('application/yaml').send(readFileSync(new URL('../../contracts/openapi.email-bot.v1.yaml',import.meta.url))));
   await app.register(staticFiles,{root:fileURLToPath(new URL('../admin-web/',import.meta.url))});
   return app;
 }

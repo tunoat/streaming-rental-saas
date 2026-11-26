@@ -6,10 +6,13 @@ import {appServer} from '../../apps/api/server.mjs';
 import {pool} from '../../apps/api/db.mjs';
 import {WorkerClient} from '../../packages/shared/worker-client.mts';
 import {runOnce} from '../../apps/mock-worker/worker.mjs';
+import {runGmailOnce} from '../../apps/gmail-worker/worker.mjs';
+import {GmailWorkerClient} from '../../packages/shared/gmail-worker-client.mts';
 import pg from 'pg';
 
 test('one-time bootstrap and Thai mock rental walkthrough on mobile',async({page},info)=>{
   test.setTimeout(60000);
+  page.setDefaultTimeout(8000);
   const username='root-'+randomUUID();
   const password='Disposable-Browser-2026!';
   const storeName='ร้านทดสอบ '+randomUUID().slice(0,8);
@@ -66,7 +69,7 @@ test('one-time bootstrap and Thai mock rental walkthrough on mobile',async({page
     await login('owner-'+username);
     await expect(page.getByRole('heading',{name:'เริ่มต้นใช้งานร้าน'})).toBeVisible();
     await expect(button('ผู้ดูแลระบบ')).toHaveCount(0);
-    const picker=page.getByLabel('ร้าน',{exact:true});
+    const picker=page.locator('#store');
     await button('ตั้งค่า Owner').click();
     await fill({'ชื่อร้าน':storeName+' สาขา'});
     await button('ส่งคำขอเพิ่มร้าน').click();
@@ -87,7 +90,7 @@ test('one-time bootstrap and Thai mock rental walkthrough on mobile',async({page
     const form=index=>page.locator('#view form').nth(index);
     const streamingEmail='inventory-'+username+'@example.invalid';
     await button('อีเมลบัญชีสตรีมมิง').click();
-    await fill({'อีเมลบัญชีจำลอง':streamingEmail,'รหัสผ่านอีเมล':'Demo-Mail-Only!'},form(0));
+    await fill({'อีเมลบัญชีจำลอง':streamingEmail,'รหัสผ่านอีเมลจำลอง (ไม่บังคับ)':'Demo-Mail-Only!'},form(0));
     await button('เพิ่มอีเมล').click();
     await expect(page.getByText(streamingEmail+' · ยังไม่ได้ผูกบัญชี')).toBeVisible();
     await button('บัญชีสตรีมมิง').click();
@@ -95,11 +98,11 @@ test('one-time bootstrap and Thai mock rental walkthrough on mobile',async({page
     await expect(platform.getByRole('option')).toHaveText(['Netflix']);
     await expect(platform).toHaveValue('netflix');
     await expect(page.getByLabel('จำนวนโปรไฟล์',{exact:true})).toHaveValue('5');
-    await page.getByLabel('อีเมลบัญชีสตรีมมิง',{exact:true}).selectOption({label:streamingEmail});
+    await page.locator('select[name=email_id]').selectOption({label:streamingEmail});
     await expect(form(0).locator('input[type=password]')).toHaveCount(0);
     await fill({'จำนวนโปรไฟล์':'3','OTP จำลอง':'123456','ค่าบริการสตรีมมิงต่อเดือน (บาท)':'400'});
     await button('Bind บัญชี',form(0)).click();
-    await page.getByRole('button',{name:/Netflix · i•••@example.invalid/}).click();
+    await page.locator('button.inventory-account').filter({hasText:streamingEmail}).click();
     await expect(page.getByText('profile3',{exact:true})).toBeVisible();
     const costForm=page.locator('#view form').filter({has:button('บันทึกต้นทุน')});
     await fill({'ค่าโบรกเกอร์ต่อเดือน (บาท)':'20','ค่าบริการสตรีมมิงต่อเดือน (บาท)':'400'},costForm);
@@ -130,13 +133,13 @@ test('one-time bootstrap and Thai mock rental walkthrough on mobile',async({page
     await expect(page.getByRole('heading',{name:'ตรวจสอบและอนุมัติเครดิตจำลอง'})).toHaveCount(0);
     await button('ตั้งค่า').click();
     await fill({'ชื่อแพ็กเกจ':'Netflix รายสัปดาห์','ราคา (บาท)':'50'},form(0));
-    await form(0).getByLabel('จำนวนวัน',{exact:true}).selectOption('7');
+    await form(0).locator('select[name=days]').selectOption('7');
     await button('เพิ่มแพ็กเกจ',form(0)).click();
     await expect(page.getByText('Netflix · Netflix รายสัปดาห์ · 7 วัน · ฿50.00')).toBeVisible();
     await button('ออเดอร์').click();
-    const packagePicker=page.getByLabel('ราคาแพ็กเกจ',{exact:true});
+    const packagePicker=page.locator('select[name=package_id]');
     await expect(packagePicker).toBeDisabled();
-    await page.getByLabel('บริการสตรีมมิง',{exact:true}).selectOption('netflix');
+    await form(0).locator('select[name=platform]').selectOption('netflix');
     await packagePicker.selectOption({label:'Netflix รายสัปดาห์ · 7 วัน · ฿50.00'});
     await button('สร้างออเดอร์',form(0)).click();
     await expect(page.getByText('50.00 บาท · รอจัดสรร')).toBeVisible();
@@ -162,6 +165,25 @@ test('one-time bootstrap and Thai mock rental walkthrough on mobile',async({page
     await page.getByRole('button',{name:/ลูกค้าจำลอง.*เครดิต/}).click();
     await expect(page.getByRole('heading',{name:'แก้ไขข้อมูลลูกค้า'})).toBeVisible();
     await expect(page.locator('summary').filter({hasText:'จัดการเครดิต'})).toBeVisible();
+    const gmailWorkerId='gmail-browser-'+randomUUID();
+    const gmailToken=randomBytes(32).toString('base64url');
+    await exec(process.execPath,['apps/api/cli.mjs','gmail-worker',gmailWorkerId,store.id],{env:{
+      ...process.env,GMAIL_ADAPTER:'mock',MIGRATION_DATABASE_URL:process.env.TEST_DATABASE_URL,BOT_WORKER_TOKEN:gmailToken
+    }});
+    await button('อีเมลบัญชีสตรีมมิง').click();
+    await page.getByRole('button',{name:new RegExp(streamingEmail)}).click();
+    const popupPromise=page.waitForEvent('popup');
+    await button('เชื่อม Gmail').click();
+    const popup=await popupPromise;
+    await popup.getByRole('button',{name:'Allow'}).click();
+    await expect(popup.getByRole('heading',{name:'Gmail verification queued'})).toBeVisible();
+    await popup.close();
+    const gmailClient=new GmailWorkerClient(base,gmailToken,gmailWorkerId,store.id);
+    expect((await runGmailOnce(gmailClient))?.status).toBe('CONNECTED');
+    await expect(page.getByText('โหมด Gmail จำลอง · เชื่อม Gmail แล้ว')).toBeVisible({timeout:12000});
+    page.once('dialog',dialog=>dialog.accept());
+    await button('ยกเลิกการเชื่อม Gmail').click();
+    await expect(page.getByText('โหมด Gmail จำลอง · ยกเลิกการเชื่อม Gmail แล้ว')).toBeVisible();
     await page.screenshot({path:info.outputPath('thai-owner-mobile.png'),fullPage:true});
   } finally { await app.close(); await pool.end(); await db.end(); }
 });

@@ -1,0 +1,311 @@
+openapi: 3.1.0
+info:
+  title: Gmail inbox verification (test module)
+  version: 1.0.0
+servers:
+  - url: http://127.0.0.1:3000
+security:
+  - bearer: []
+paths:
+  /v1/stores/{storeId}/email-addresses/{emailId}/connections/gmail/authorize:
+    parameters: &owner
+      - $ref: '#/components/parameters/Store'
+      - $ref: '#/components/parameters/Email'
+    post:
+      operationId: authorizeGmail
+      summary: Start Gmail consent
+      parameters: &writes
+        - $ref: '#/components/parameters/Key'
+      responses:
+        '200':
+          description: Short lived authorization and browser-binding cookie
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authorization_url, expires_at]
+                properties:
+                  authorization_url: {type: string}
+                  expires_at: {type: string, format: date-time}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/oauth/google/callback:
+    get:
+      operationId: gmailCallback
+      summary: Finish Gmail consent in the browser
+      security: []
+      parameters:
+        - {name: state, in: query, required: true, schema: {type: string}}
+        - {name: code, in: query, schema: {type: string}}
+        - {name: error, in: query, schema: {type: string}}
+        - {name: decision, in: query, schema: {enum: [allow, deny]}}
+      responses:
+        '303': {description: 'Fixed local result path with opaque status and no credentials'}
+  /v1/stores/{storeId}/email-addresses/{emailId}/connection:
+    parameters: *owner
+    get:
+      operationId: getGmailConnection
+      summary: Read connection status
+      responses:
+        '200':
+          description: Sanitized Gmail status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Connection'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/stores/{storeId}/email-addresses/{emailId}/connection/verify:
+    parameters: *owner
+    post:
+      operationId: verifyGmailConnection
+      summary: Request inbox verification
+      parameters: *writes
+      responses:
+        '202':
+          description: Verification job identifier
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job_id]
+                properties:
+                  job_id: {type: string, format: uuid}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/stores/{storeId}/email-addresses/{emailId}/connection/disconnect:
+    parameters: *owner
+    post:
+      operationId: disconnectGmail
+      summary: Disconnect Gmail
+      parameters: *writes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [confirm]
+              properties:
+                confirm: {const: true}
+      responses:
+        '200':
+          description: Local disconnect committed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, remote_revocation]
+                properties:
+                  status: {const: DISCONNECTED}
+                  remote_revocation: {enum: [SUCCEEDED, UNCONFIRMED, NOT_APPLICABLE, SHARED_GRANT]}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/email-worker/stores/{storeId}/jobs/claim:
+    parameters:
+      - $ref: '#/components/parameters/Store'
+    post:
+      operationId: claimGmailJob
+      summary: Claim one Gmail job
+      parameters: *writes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Worker'}
+            example: {worker_id: gmail-mock-local}
+      responses:
+        '200':
+          description: One scoped Gmail verification job
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Claim'}
+        '204': {description: No eligible work or no store capacity}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/email-worker/stores/{storeId}/jobs/{jobId}/start:
+    parameters: &job
+      - $ref: '#/components/parameters/Store'
+      - $ref: '#/components/parameters/Job'
+    post:
+      operationId: startGmailJob
+      summary: Start a leased Gmail job
+      parameters: *writes
+      requestBody: &leaseBody
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Lease'}
+      responses: &transition
+        '200':
+          description: Accepted transition
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {enum: [RUNNING, CONNECTED, AUTH_REQUIRED, FAILED]}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/email-worker/stores/{storeId}/jobs/{jobId}/heartbeat:
+    parameters: *job
+    post:
+      operationId: heartbeatGmailJob
+      summary: Renew a running lease
+      parameters: *writes
+      requestBody: *leaseBody
+      responses: *transition
+  /v1/email-worker/stores/{storeId}/jobs/{jobId}/access-token:
+    parameters: *job
+    post:
+      operationId: brokerGmailToken
+      summary: Get a provider access token
+      description: Live mode only. Requires a current running lease. Never cached.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TokenRequest'}
+      responses:
+        '200':
+          description: Provider access token with provider-assigned expiry
+          headers:
+            Cache-Control:
+              schema: {const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AccessToken'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/email-worker/stores/{storeId}/jobs/{jobId}/complete:
+    parameters: *job
+    post:
+      operationId: completeGmailJob
+      summary: Submit sanitized verification evidence
+      parameters: *writes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Verification'}
+      responses: *transition
+  /v1/email-worker/stores/{storeId}/jobs/{jobId}/fail:
+    parameters: *job
+    post:
+      operationId: failGmailJob
+      summary: Report a sanitized failure
+      parameters: *writes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Failure'}
+      responses: *transition
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer}
+  parameters:
+    Store: {name: storeId, in: path, required: true, schema: {type: string, format: uuid}}
+    Email: {name: emailId, in: path, required: true, schema: {type: string, format: uuid}}
+    Job: {name: jobId, in: path, required: true, schema: {type: string, format: uuid}}
+    Key: {name: Idempotency-Key, in: header, required: true, schema: {type: string, pattern: '^[A-Za-z0-9_-]{8,128}$'}}
+  responses:
+    Error:
+      description: Sanitized API error
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [code]
+            properties:
+              code: {type: string}
+              message: {type: string}
+              request_id: {type: string}
+          example: {code: STALE_FENCING_TOKEN}
+  schemas:
+    Evidence:
+      type: object
+      additionalProperties: false
+      required: [provenance, identity_match, profile_ok, list_ok, empty_inbox, metadata_read, observed_at]
+      properties:
+        provenance: {enum: [MOCK, LIVE]}
+        identity_match: {const: true}
+        profile_ok: {const: true}
+        list_ok: {const: true}
+        empty_inbox: {type: boolean}
+        metadata_read: {type: boolean}
+        observed_at: {type: string, format: date-time}
+    Connection:
+      type: object
+      required: [provider, mode, status, last_verified_at, error, evidence]
+      properties:
+        provider: {const: gmail}
+        mode: {enum: [mock, live]}
+        status: {enum: [NOT_CONNECTED, AUTHORIZING, VERIFYING, CONNECTED, AUTH_REQUIRED, FAILED, DISCONNECTED]}
+        last_verified_at: {type: [string, 'null'], format: date-time}
+        error: {type: [string, 'null']}
+        evidence:
+          anyOf:
+            - $ref: '#/components/schemas/Evidence'
+            - type: 'null'
+    Worker:
+      type: object
+      additionalProperties: false
+      required: [worker_id]
+      properties:
+        worker_id: &worker {type: string, pattern: '^[A-Za-z0-9_-]{1,128}$'}
+    Lease:
+      type: object
+      additionalProperties: false
+      required: [worker_id, lease_token, fencing_token]
+      properties:
+        worker_id: *worker
+        lease_token: &secret {type: string, pattern: '^[A-Za-z0-9_-]{43}$'}
+        fencing_token: &generation {type: integer, minimum: 1}
+    Claim:
+      type: object
+      required: [id, email_id, generation, mode, fence, lease_token]
+      properties:
+        id: {type: string, format: uuid}
+        email_id: {type: string, format: uuid}
+        generation: *generation
+        mode: {enum: [mock, live]}
+        fence: *generation
+        lease_token: *secret
+    TokenRequest:
+      type: object
+      additionalProperties: false
+      required: [worker_id, lease_token, fencing_token]
+      properties:
+        worker_id: *worker
+        lease_token: *secret
+        fencing_token: *generation
+        refresh: {type: boolean}
+    AccessToken:
+      type: object
+      required: [access_token, expires_at, email]
+      properties:
+        access_token: {type: string}
+        expires_at: {type: string, format: date-time}
+        email: {type: string, format: email}
+    Verification:
+      type: object
+      additionalProperties: false
+      required: [worker_id, lease_token, fencing_token, generation, provenance, identity_match, profile_ok, list_ok, empty_inbox, metadata_read, observed_at]
+      properties:
+        provenance: {enum: [MOCK, LIVE]}
+        identity_match: {const: true}
+        profile_ok: {const: true}
+        list_ok: {const: true}
+        empty_inbox: {type: boolean}
+        metadata_read: {type: boolean}
+        observed_at: {type: string, format: date-time}
+        worker_id: *worker
+        lease_token: *secret
+        fencing_token: *generation
+        generation: *generation
+    Failure:
+      type: object
+      additionalProperties: false
+      required: [worker_id, lease_token, fencing_token, generation, error]
+      properties:
+        worker_id: *worker
+        lease_token: *secret
+        fencing_token: *generation
+        generation: *generation
+        error:
+          enum: [AUTH_REQUIRED, IDENTITY_MISMATCH, IDENTITY_INVALID, SCOPE_INVALID, PROVIDER_UNAVAILABLE, PROVIDER_REJECTED, TOKEN_REJECTED, EVIDENCE_INVALID, LEASE_EXPIRED]

@@ -61,7 +61,7 @@ async function reap(q,store,actor,requestId) {
 }
 const canonical = value => Array.isArray(value) ? value.map(canonical) :
   value && typeof value==='object' ? Object.fromEntries(Object.keys(value).sort().map(k=>[k,canonical(value[k])])) : value;
-async function idempotent(q,auth,store,req,fn) {
+export async function idempotent(q,auth,store,req,fn) {
   const key=req.headers['idempotency-key'];
   const fingerprint=digest(JSON.stringify(canonical(req.body)));
   const route=req.url.split('?')[0];
@@ -75,7 +75,7 @@ async function idempotent(q,auth,store,req,fn) {
   await q('INSERT INTO requests VALUES($1,$2,$3,$4,$5,$6,$7)',[...params,fingerprint,status,response]);
   return [status,response];
 }
-async function lockStore(q,store) {
+export async function lockStore(q,store) {
   await q('SELECT pg_advisory_xact_lock(hashtextextended($1,1))',[store]);
 }
 function completedEvidence(b,job,action) {
@@ -176,6 +176,7 @@ export function registerJobs(secured) {
           return [200,publicJob(changed)];
         });
       }
+      if ((await q('SELECT 1 FROM gmail_workers WHERE worker_id=$1',[auth.id])).rowCount) reject(403,'FORBIDDEN');
       const {rows:stores}=await q('SELECT store_id FROM worker_stores WHERE worker_id=$1 ORDER BY store_id',[auth.id]);
       if (req.body && req.body.worker_id!==auth.id) reject(403,'FORBIDDEN');
       if (operation==='claim') {
@@ -191,7 +192,8 @@ export function registerJobs(secured) {
             await reap(q,store,auth.id,req.id);
             const {rows:[job]}=await q(`SELECT * FROM jobs WHERE store_id=$1 AND status IN ('QUEUED','RETRY_WAIT')
               AND type=ANY($2::text[]) AND ready_at<=now()
-              AND (SELECT count(*) FROM jobs WHERE store_id=$1 AND status IN ('LEASED','RUNNING'))<4
+              AND (SELECT count(*) FROM jobs WHERE store_id=$1 AND status IN ('LEASED','RUNNING'))+
+                  (SELECT count(*) FROM gmail_jobs WHERE store_id=$1 AND status IN ('LEASED','RUNNING') AND lease_until>clock_timestamp())<4
               ORDER BY CASE WHEN created_at<now()-interval '30 minutes' THEN least(priority,2) ELSE priority END,
               created_at,id LIMIT 1 FOR UPDATE`,[store,req.body.capabilities]);
             if (!job) continue;

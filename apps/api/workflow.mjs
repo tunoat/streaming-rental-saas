@@ -535,12 +535,13 @@ export function registerWorkflow(secured) {
     const {rows:[archived]}=await q(`SELECT id FROM streaming_email_addresses
       WHERE store_id=$1 AND email=$2 AND archived_at IS NOT NULL`,[s,email]);
     const id=archived?.id??randomUUID();
+    const password=b.password??'';
     return insert(q,`INSERT INTO streaming_email_addresses(store_id,email,id,password_hash,encrypted_password)
       VALUES($1,$2,$3,$4,$5) ON CONFLICT(store_id,email) DO UPDATE
       SET archived_at=NULL,password_hash=excluded.password_hash,encrypted_password=excluded.encrypted_password
       WHERE streaming_email_addresses.archived_at IS NOT NULL
-      RETURNING id,email,true AS password_set`,
-      [s,email,id,await passwordHash(b.password),encryptCredential(b.password,s,'email:'+id)])
+      RETURNING id,email,password_hash IS NOT NULL AS password_set`,
+      [s,email,id,password===''?null:await passwordHash(password),password===''?null:encryptCredential(password,s,'email:'+id)])
       .then(entry=>entry??reject(409,'STREAMING_EMAIL_EXISTS'));
   },{owner:true,sale:true});
   register('GET','streaming-emails/:emailId',async(q,s,b,{params:{emailId}})=>{
