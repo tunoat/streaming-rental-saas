@@ -2,14 +2,24 @@ import { t, getLanguage, setLanguage, locale } from './i18n.js';
 
 const byId=id=>document.getElementById(id);
 const view=byId('view');
-let session,identity,store,role,selectedAccount,orderPoll,page='home',renderId=0;
+let session,identity,store,role,selectedAccount,selectedCustomer,orderPoll,page='home',renderId=0;
 let adminOwnerId,adminShopId;
+let historyPage=0,bellPoll,pendingRequests=0,bellVersion=0;
 const ownerDirectory={page:0,query:''}, shopDirectory={page:0,query:''};
+const customerDirectory={page:0,query:''};
+const inventoryDirectories=new Map();
+let selectedStreamingEmail;
 const errors={
+  get PRIMARY_PROFILE_RESERVED(){return t('โปรไฟล์หลักไม่สามารถนำไปให้เช่าหรือลบได้');},
+  get CANCELLATION_UNAVAILABLE(){return t('รายการเช่านี้ไม่สามารถยกเลิกได้');},
+  get CANCELLATION_QUOTE_CHANGED(){return t('ยอดเครดิตคืนเปลี่ยนแล้ว กรุณาดูยอดล่าสุดอีกครั้ง');},
   get USE_ACTIVE_STORE(){return t('กรุณาเลือกหนึ่งในร้านที่เปิดใช้งานก่อนขอเพิ่มร้าน');},
   get OWNER_UNAVAILABLE(){return t('กรุณาเลือก Owner ที่ยังใช้งานได้');},
   get STREAMING_EMAIL_BOUND(){return t('อีเมลนี้ผูกกับบัญชีแล้ว จึงยังเปลี่ยนที่อยู่อีเมลไม่ได้');},
   get PROFILE_IN_USE(){return t('โปรไฟล์นี้มีการใช้งานหรืองานค้าง จึงยังทำรายการไม่ได้');},
+  get ACCOUNT_IN_USE(){return t('บัญชีนี้ยังมีการเช่าหรืองานที่ดำเนินอยู่ จึงลบไม่ได้');},
+  get REFUND_IN_PROGRESS(){return t('รายการนี้กำลังคืนเครดิต กรุณารอให้คืนเครดิตเสร็จก่อนลบ');},
+  get STREAMING_EMAIL_EXISTS(){return t('อีเมลนี้มีอยู่แล้ว');},
   get INVALID_PROFILE_PIN(){return t('กรุณากรอก PIN จำลองเป็นตัวเลข 4 หลัก');},
   get STORE_SETTINGS_CHANGED(){return t('ข้อมูลร้านเปลี่ยนแล้วหรือร้านปิดแล้ว กรุณาเปิดหน้าร้านค้าใหม่');},
   get INVALID_EXPIRY(){return t('กรุณาเลือกวันหมดอายุที่ถูกต้อง');},
@@ -46,6 +56,7 @@ const storeDay=new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Bangkok',year:'nu
 const streamingPlatforms=[['netflix','Netflix']];
 const platformName=platform=>streamingPlatforms.find(([id])=>id===platform)?.[1]??platform;
 const accountLabel=account=>platformName(account.platform)+' · '+account.email.replace(/^(.).*(@.*)$/,'$1•••$2');
+const inventoryAccountLabel=account=>platformName(account.platform)+' · '+account.email;
 const profileStatus={get AVAILABLE(){return t('พร้อมใช้งาน');},get RESERVED(){return t('รอส่งมอบ');},get OCCUPIED(){return t('กำลังใช้งาน');},get HELD(){return t('พักการใช้งาน');}};
 const customerLabel=customer=>customer.name+(customer.alias?' ('+customer.alias+')':'');
 const customerContactFields=(customer={})=>[
@@ -74,8 +85,18 @@ const notice=message=>{byId('notice').textContent=message;};
 function element(tag,text,parent=view) {
   const node=document.createElement(tag);
   if(text!==undefined) node.textContent=text;
+  if(tag==='details'){
+    const ancestor=parent.closest('details');
+    node.dataset.menuLevel=ancestor?Number(ancestor.dataset.menuLevel)+1:0;
+    node.setAttribute('name','menu-'+node.dataset.menuLevel);
+  }
   parent.append(node);
   return node;
+}
+function disclosure(parent,title){
+  const section=element('details',undefined,parent);
+  element('summary',title,section);
+  return section;
 }
 async function request(path,body) {
   const headers={};
@@ -95,7 +116,9 @@ function list(rows,description,parent=view) {
 function form(title,fields,submit,parent=view,buttonText=t('บันทึก')) {
   element('h2',title,parent);
   const node=element('form',undefined,parent);
+  const confirmOnSubmit=fields.some(([, ,type])=>type==='checkbox');
   for(const [name,title,type='text',options] of fields){
+    if(type==='checkbox') continue;
     const label=element('label',title,node);
     const input=element(options?'select':'input',undefined,label);
     input.name=name;
@@ -113,7 +136,8 @@ function form(title,fields,submit,parent=view,buttonText=t('บันทึก')
     event.preventDefault();
     button.disabled=true;
     notice(t('กำลังบันทึก…'));
-    const data=Object.fromEntries(Array.from(new FormData(node),([name,value])=>[name,node.elements.namedItem(name)?.type==='checkbox'?true:value]));
+    const data=Object.fromEntries(new FormData(node));
+    if(confirmOnSubmit) data.confirm=true;
     try { await submit(data); await render(); notice(t('บันทึกสำเร็จ')); }
     catch(error){ notice(error.message); }
     finally { button.disabled=false; }
@@ -121,6 +145,33 @@ function form(title,fields,submit,parent=view,buttonText=t('บันทึก')
   return node;
 }
 const choices=(rows,format)=>rows.map(row=>[row.id,format(row)]);
+function replacementForm(parent,rental,accounts){
+  if(!accounts.length){
+    element('p',t('ยังไม่มีโปรไฟล์ว่างที่รองรับวันหมดอายุเดิม'),parent);
+    return;
+  }
+  const path='rentals/'+rental.id+'/replacement';
+  const panel=form(t('จัดสรรโปรไฟล์ใหม่'),[
+    ['account_id',t('บัญชีสตรีมมิง'),'', [['',t('เลือกบัญชี')],...choices(accounts,inventoryAccountLabel)]],
+    ['profile_id',t('โปรไฟล์ว่าง'),'',[]]
+  ],data=>shop(path,data),parent,t('ส่งมอบโปรไฟล์ใหม่'));
+  const account=panel.elements.account_id, profile=panel.elements.profile_id;
+  const submit=panel.querySelector('button');
+  account.onchange=()=>{
+    const available=accounts.find(row=>row.id===account.value)?.profiles??[];
+    profile.replaceChildren(new Option(t('เลือกโปรไฟล์ว่าง'),''),...available.map(row=>new Option(row.label,row.id)));
+    profile.disabled=!available.length;
+    submit.disabled=true;
+  };
+  profile.onchange=()=>{submit.disabled=!profile.value;};
+  account.onchange();
+}
+function removalForm(title,label,submit,fields=[]){
+  const section=element('details');
+  element('summary',title,section);
+  form(title,[...fields,['current_password',t('รหัสผ่านปัจจุบัน'),'password'],
+    ['confirm',label,'checkbox']],submit,section,title);
+}
 function passwordForm(submit) {
   form(t('เปลี่ยนรหัสผ่าน'),[
     ['current_password',t('รหัสผ่านปัจจุบัน'),{type:'password',autocomplete:'current-password'}],
@@ -178,9 +229,9 @@ function dailySalesReport(parent,days){
   const dateLabel=day=>date.format(new Date(day+'T00:00:00Z'));
   const currency=value=>value===null?'—':baht.format(value);
   element('h2',t('ยอดขายและกำไรรายวัน'),parent);
-  element('p',t('จัดกลุ่มตามวันที่ซื้อในเวลาไทย กำไรจะคำนวณเมื่อส่งมอบแล้วและมีข้อมูลต้นทุน'),parent);
-  summaryTable(parent,[t('วันที่'),t('แพ็กเกจขายได้'),t('ยอดขาย'),t('ต้นทุนออเดอร์'),t('กำไรหลังหักต้นทุนบัญชี'),t('รอสรุปกำไร')],
-    days.map(row=>[dateLabel(row.day),row.sold,currency(row.sales),currency(row.cost),currency(row.profit),row.pending]));
+  element('p',t('กำไรคือยอดขายหักต้นทุนตามระยะเวลาเช่า รายการที่ปิดก่อนกำหนดคิดต้นทุนถึงเวลาที่ปิด'),parent);
+  summaryTable(parent,[t('วันที่'),t('แพ็กเกจขายได้'),t('ยอดขาย'),t('ต้นทุนออเดอร์'),t('กำไรหลังหักต้นทุนบัญชี')],
+    days.map(row=>[dateLabel(row.day),row.sold,currency(row.sales),currency(row.cost),currency(row.profit)]));
   const active=days.filter(row=>row.orders>0);
   if(!active.length) return;
   const label=element('label',t('เลือกวันเพื่อดูรายละเอียดออเดอร์'),parent);
@@ -209,8 +260,7 @@ function dailySalesReport(parent,days){
     }
   };
 }
-function directoryButtons(parent,rows,state,select,format,searchLabel){
-  const pageSize=8;
+function directoryButtons(parent,rows,state,select,format,searchLabel,pageSize=35){
   const label=element('label',searchLabel,parent);
   label.className='directory-search';
   const search=element('input',undefined,label);
@@ -252,12 +302,12 @@ async function adminStoreDirectory(current){
   if(!current()) return;
   const owner=owners.find(row=>row.id===adminOwnerId);
   if(!owner){
-    element('h1',t('ร้านค้า'));
+    element('h1',t('จัดการ Owner'));
     element('h2',t('เลือก Owner'));
     if(!owners.length) element('p',t('เพิ่มผู้ใช้ระดับ Owner จากไอคอนรูปคนก่อนสร้างร้าน'));
     else directoryButtons(view,owners,ownerDirectory,row=>{
       adminOwnerId=row.id;adminShopId=undefined;shopDirectory.page=0;shopDirectory.query='';render();
-    },row=>[row.username,t('จำนวนร้าน: ')+row.store_count],t('ค้นหา Owner'));
+    },row=>[row.username,t('จำนวนร้าน: ')+row.store_count],t('ค้นหา Owner'),40);
     return;
   }
   const [overview,stores]=await Promise.all([
@@ -277,6 +327,10 @@ async function adminStoreDirectory(current){
       row=>[row.name,storeStatus[row.status]],t('ค้นหาร้านค้า'));
     if(owner.active) form(t('สร้างร้านค้า'),[['name',t('ชื่อร้าน')],['current_password',t('รหัสผ่านปัจจุบัน'),'password']],
       data=>request('admin/stores',{...data,owner_id:owner.id}));
+    removalForm(t('ลบ Owner และร้านค้าทั้งหมด'),t('ยืนยันลบ Owner ร้านค้า และสิทธิ์พนักงานที่เกี่ยวข้อง'),async data=>{
+      await request('admin/owners/'+owner.id+'/remove',data);
+      adminOwnerId=adminShopId=undefined;
+    });
     return;
   }
   const path='admin/stores/'+selected.id+'/';
@@ -307,46 +361,96 @@ async function adminStoreDirectory(current){
 }
 function allocationForm(orders,customers,parent) {
   const names=new Map(customers.map(customer=>[customer.id,customerLabel(customer)]));
+  let accountId,profileId;
   const panel=form(t('จัดสรรโปรไฟล์และส่งงานจำลอง'),[
     ['order_id',t('ออเดอร์รอจัดสรร'),'',choices(orders,row=>[
       platformName(row.platform)??t('ออเดอร์เดิม'),names.get(row.customer_id),daysLabel(row.days),row.amount+t(' บาท'),row.id.slice(0,8)
     ].filter(Boolean).join(' · '))],
     ['query',t('ค้นหาบัญชีสตรีมมิง'),{type:'search',required:false,placeholder:t('ชื่อบริการหรืออีเมลบัญชี')}]
-  ],({account_id,order_id})=>shop('allocate',{account_id,order_id}),parent,t('จัดสรรและส่งงาน'));
+  ],({order_id})=>shop('allocate',{account_id:accountId,order_id,profile_id:profileId}),parent,t('จัดสรรและส่งงาน'));
   const submit=panel.querySelector('button');
   const search=panel.elements.query;
   const order=panel.elements.order_id;
   let accounts=[],loadId=0;
+  const requestedChecks=new Set();
   const field=element('fieldset',undefined,panel);
   field.className='allocation-accounts';
   const legend=element('legend',t('บัญชีสำหรับออเดอร์ที่เลือก'),field);
   const results=element('div',undefined,field);
+  results.className='directory-grid';
   panel.insertBefore(field,submit);
+  const profileField=element('fieldset',undefined,panel);
+  profileField.className='allocation-accounts';
+  element('legend',t('โปรไฟล์ว่าง'),profileField);
+  const profileButtons=element('div',undefined,profileField);
+  profileButtons.className='directory-grid';
+  const readinessNote=element('p',undefined,profileField);
+  readinessNote.setAttribute('aria-live','polite');
+  const verify=element('button',t('ตรวจสอบสมาชิก'),profileField);
+  verify.type='button';
+  panel.insertBefore(profileField,submit);
+  function readiness(account){
+    if(account.available_profiles===0) return t('ไม่มีโปรไฟล์ว่าง');
+    if(account.accepts_waiting_order) return t('พร้อมจัดสรร');
+    switch(account.blocked_reason){
+      case 'ACCOUNT_BLOCKED': return t('บัญชีถูกระงับ ต้องตรวจสอบการกู้คืนบัญชี');
+      case 'NOT_VERIFIED': return t('บัญชียังไม่ได้ยืนยันสมาชิก');
+      case 'CHECK_EXPIRED': return t('ผลตรวจสมาชิกเกิน 24 ชั่วโมง กรุณาตรวจสมาชิกใหม่');
+      case 'SUBSCRIPTION_EXPIRED': return t('สมาชิกสตรีมมิงหมดอายุแล้ว');
+      case 'SUBSCRIPTION_TOO_SHORT': return t('สมาชิกหมดอายุวันที่ ')+storeDate.format(new Date(account.subscription_until))+
+        ' · '+t('ออเดอร์ต้องใช้ถึง ')+storeDate.format(new Date(account.required_until));
+      default: return t('ยังไม่พร้อมสำหรับออเดอร์นี้');
+    }
+  }
+  function updateSelection(account){
+    for(const button of profileButtons.querySelectorAll('button')){
+      button.setAttribute('aria-pressed',String(button.value===profileId));
+    }
+    submit.disabled=!account?.accepts_waiting_order||!profileId;
+  }
+  function showProfiles(account){
+    const profiles=account?.profiles??[];
+    if(!profiles.some(profile=>profile.id===profileId)) profileId=undefined;
+    profileButtons.replaceChildren();
+    profileField.hidden=!account;
+    verify.hidden=!['NOT_VERIFIED','CHECK_EXPIRED','SUBSCRIPTION_EXPIRED'].includes(account?.blocked_reason);
+    readinessNote.textContent=requestedChecks.has(account?.id)?t('กำลังตรวจสมาชิก…'):
+      account&&!account.accepts_waiting_order&&verify.hidden?readiness(account):'';
+    verify.disabled=requestedChecks.has(account?.id);
+    for(const profile of profiles){
+      const button=element('button',profile.label,profileButtons);
+      Object.assign(button,{type:'button',value:profile.id});
+      button.onclick=()=>{profileId=profile.id;updateSelection(account);};
+    }
+    updateSelection(account);
+  }
   function showAccounts(){
-    const selected=results.querySelector('input:checked')?.value;
     const query=search.value.trim().toLowerCase();
     const matches=accounts.filter(account=>(platformName(account.platform)+' '+account.email).toLowerCase().includes(query));
+    const selected=matches.find(account=>account.id===accountId&&account.available_profiles>0);
+    accountId=selected?.id;
     results.replaceChildren();
-    submit.disabled=true;
     if(!matches.length) element('p',query?t('ไม่พบบัญชีที่ตรงกับคำค้น'):t('ยังไม่มีบัญชีสตรีมมิง'),results);
     for(const account of matches){
-      const eligible=account.available_profiles>0&&account.accepts_waiting_order;
-      const label=element('label',undefined,results);
-      const radio=element('input',undefined,label);
-      Object.assign(radio,{type:'radio',name:'account_id',value:account.id,disabled:!eligible,required:eligible});
-      radio.checked=eligible&&selected===account.id;
-      if(radio.checked) submit.disabled=false;
-      radio.onchange=()=>{submit.disabled=false;};
-      const readiness=eligible?t('พร้อมจัดสรร'):account.available_profiles===0?t('ไม่มีโปรไฟล์ว่าง'):
-        account.health!=='HEALTHY'?(status[account.health]??t('ต้องตรวจสอบ')):t('ยังไม่พร้อมสำหรับออเดอร์นี้');
-      element('span',accountLabel(account)+t(' · ว่าง ')+account.available_profiles+t(' โปรไฟล์ · ')+readiness,label);
+      const button=element('button',inventoryAccountLabel(account)+t(' · ว่าง ')+account.available_profiles+t(' โปรไฟล์'),results);
+      Object.assign(button,{type:'button',value:account.id,disabled:account.available_profiles===0});
+      button.setAttribute('aria-pressed',String(account.id===accountId));
+      button.onclick=()=>{
+        if(account.id!==accountId) profileId=undefined;
+        accountId=account.id;
+        for(const item of results.querySelectorAll('button')) item.setAttribute('aria-pressed',String(item===button));
+        showProfiles(account);
+      };
     }
+    showProfiles(selected);
   }
   async function loadAccounts(){
     const id=++loadId;
     const platform=orders.find(row=>row.id===order.value)?.platform;
     legend.textContent=platform?t('บัญชี ')+platformName(platform):t('บัญชีสำหรับออเดอร์ที่เลือก');
     accounts=[];
+    accountId=profileId=undefined;
+    showProfiles();
     submit.disabled=true;
     search.disabled=true;
     results.replaceChildren();
@@ -365,13 +469,43 @@ function allocationForm(orders,customers,parent) {
   }
   search.addEventListener('input',showAccounts);
   order.addEventListener('change',loadAccounts);
+  verify.onclick=async()=>{
+    const target=accountId;
+    if(!target||requestedChecks.has(target)) return;
+    const currentLoad=loadId;
+    requestedChecks.add(target);
+    verify.disabled=true;
+    readinessNote.textContent=t('กำลังตรวจสมาชิก…');
+    try{
+      const job=await shop('bot-jobs',{type:'VERIFY_SUBSCRIPTION',account_id:target,reason:'Verify subscription for order allocation'});
+      for(let attempt=0;attempt<20;attempt++){
+        if(!panel.isConnected||currentLoad!==loadId) return;
+        const result=await shop('bot-jobs/'+job.id);
+        if(result.status==='SUCCEEDED'){
+          const updated=await shop('allocation-accounts?order_id='+encodeURIComponent(order.value));
+          if(panel.isConnected&&currentLoad===loadId){accounts=updated;showAccounts();}
+          return;
+        }
+        if(['FAILED','DEAD_LETTER','CANCELLED'].includes(result.status)) throw new Error(t('ตรวจสมาชิกไม่สำเร็จ'));
+        await new Promise(resolve=>setTimeout(resolve,1500));
+      }
+      if(panel.isConnected&&currentLoad===loadId) notice(t('งานตรวจสมาชิกยังอยู่ในคิว'));
+    }catch(error){
+      if(panel.isConnected&&currentLoad===loadId) notice(error.message);
+    }finally{
+      requestedChecks.delete(target);
+      if(panel.isConnected&&currentLoad===loadId&&accountId===target)
+        showProfiles(accounts.find(account=>account.id===target));
+    }
+  };
   loadAccounts();
 }
 function nav() {
-  const menus=identity.is_super?[['home',t('ร้านค้า')],['requests',t('คำขอเพิ่มร้านค้า')],['admins',t('ผู้ดูแลระบบ')]]:
-    identity.is_admin?[['requests',t('คำขอเพิ่มร้านค้า')]]:!store?[]:
+  const menus=identity.is_super?[['home',t('จัดการ Owner')],['request-history',t('ประวัติการอนุมัติเปิดร้าน')],['admins',t('ผู้ดูแลระบบ')]]:
+    identity.is_admin?[['request-history',t('ประวัติการอนุมัติเปิดร้าน')]]:!store?[]:
     [['home',t('ภาพรวม')],['orders',t('ออเดอร์')],['rentals',t('การเช่า')],['customers',t('ลูกค้า')],['inventory',t('บัญชีสตรีมมิง')],
-      ...(role==='OWNER'?[['streaming-emails',t('อีเมลบัญชีสตรีมมิง')],['finance',t('การเงิน')],['settings',t('ตั้งค่า')]]:[])];
+      ...(role==='OWNER'?[['streaming-emails',t('อีเมลบัญชีสตรีมมิง')],['finance',t('การเงิน')],
+        ['wallet-log',t('บันทึกเงินเข้าออก')],['settings',t('ตั้งค่า')]]:[])];
   const panel=byId('navigation');
   panel.replaceChildren();
   for(const [key,title] of menus){
@@ -522,17 +656,38 @@ async function render() {
           ['current_password',t('รหัสผ่านปัจจุบัน'),{type:'password',autocomplete:'current-password'}]
         ],data=>request('admin/users',data),view,t('เพิ่มผู้ใช้'));
       } else if(page==='requests'){
-        const requests=await request('admin/store-requests');
+        const pending=await request('admin/store-requests?scope=pending');
         if(!current()) return;
-        element('h1',t('คำขอเพิ่มร้านค้า'));
-        list(requests,row=>row.name+' · '+row.username+' · '+requestStatus[row.status]);
-        const pending=requests.filter(row=>row.status==='PENDING');
+        element('h1',t('คำขอเปิดร้านที่รออนุมัติ'));
+        list(pending,row=>row.name+' · '+row.username);
         if(pending.length) form(t('พิจารณาคำขอ'),[
           ['id',t('คำขอ'),'',choices(pending,row=>row.name+' · '+row.username)],
           ['status',t('ผลการพิจารณา'),'',identity.is_super?
             [['',t('เลือกผลการพิจารณา')],['APPROVED',t('อนุมัติ')],['REJECTED',t('ไม่อนุมัติ')]]:[['APPROVED',t('อนุมัติ')]]],
           ['current_password',t('รหัสผ่านปัจจุบัน'),'password']
-        ],({id,...data})=>request('admin/store-requests/'+id+'/review',data),view,t('บันทึกผล'));
+        ],async({id,...data})=>{
+          await request('admin/store-requests/'+id+'/review',data);
+          await refreshBell();
+        },view,t('บันทึกผล'));
+      } else if(page==='request-history'){
+        const rows=await request('admin/store-requests?scope=history&page='+historyPage);
+        if(!current()) return;
+        element('h1',t('ประวัติการอนุมัติเปิดร้าน'));
+        if(rows.length) summaryTable(view,[t('ชื่อร้าน'),t('ผู้ส่งคำขอ'),t('ผลการพิจารณา'),t('ผู้พิจารณา'),t('วันที่พิจารณา')],
+          rows.slice(0,35).map(row=>[row.name,row.username,requestStatus[row.status],row.reviewer??'—',
+            row.reviewed_at?storeDate.format(new Date(row.reviewed_at)):'—']));
+        else element('p',t('ยังไม่มีรายการ'));
+        if(historyPage||rows.length>35){
+          const paging=element('div');
+          paging.className='directory-pagination';
+          const previous=element('button',t('ก่อนหน้า'),paging);
+          previous.disabled=historyPage===0;
+          previous.onclick=()=>{historyPage--;render();};
+          element('span',t('หน้า ')+(historyPage+1),paging);
+          const next=element('button',t('ถัดไป'),paging);
+          next.disabled=rows.length<=35;
+          next.onclick=()=>{historyPage++;render();};
+        }
       } else {
         const admins=await request('admin/admins');
         if(!current()) return;
@@ -541,6 +696,10 @@ async function render() {
         form(t('ยืนยันการเปลี่ยนสถานะผู้ดูแล'),[['id',t('ผู้ดูแลระบบ'),'',choices(admins,r=>r.username)],['active',t('สถานะ'),'',[['false',t('ปิดใช้งาน')],['true',t('เปิดใช้งาน')]]],
           ['current_password',t('รหัสผ่านปัจจุบัน'),'password'],['confirm',t('ตรวจสอบชื่อและยืนยันการเปลี่ยนสถานะ'),'checkbox']],
           ({id,active,current_password})=>request('admin/admins/'+id+'/status',{active:active==='true',current_password}));
+        const removable=admins.filter(row=>row.role==='Admin');
+        if(removable.length) removalForm(t('ลบ Admin'),t('ยืนยันลบ Admin'),
+          ({id,...data})=>request('admin/admins/'+id+'/remove',data),
+          [['id',t('ผู้ดูแลระบบ'),'', [['',t('เลือก Admin')],...choices(removable,row=>row.username)]]]);
       }
     } else if(page==='home'){
       if(role==='OWNER'){
@@ -564,13 +723,18 @@ async function render() {
       ],([done,label])=>(done?t('เสร็จแล้ว · '):t('ยังไม่เสร็จ · '))+label);
       element('p',t('การขาย การเติมเครดิต และการส่งมอบในหน้านี้เป็นข้อมูลจำลอง'));
     } else if(page==='customers'){
-      const rows=await shop('customer-renewals');
+      const rows=await shop(role==='OWNER'?'customers':'customer-directory');
       if(!current()) return;
       element('h1',t('ลูกค้า'));
-      if(role==='OWNER') form(t('เพิ่มลูกค้า'),[['name',t('ชื่อลูกค้า')],...customerContactFields()],data=>shop('customers',data));
-      if(!rows.length) element('p',t('ยังไม่มีรายการ'));
-      const now=Date.now();
-      for(const row of rows){
+      const row=rows.find(customer=>customer.id===selectedCustomer);
+      if(!row){
+        if(role==='OWNER') form(t('เพิ่มลูกค้า'),[['name',t('ชื่อลูกค้า')],...customerContactFields()],data=>shop('customers',data));
+        directoryButtons(view,rows,customerDirectory,customer=>{selectedCustomer=customer.id;render();},
+          customer=>[customerLabel(customer),customer.balance===undefined?'':t('เครดิต')+' '+baht.format(customer.balance)],
+          t('ค้นหาลูกค้า'));
+      } else {
+        const back=element('button',t('กลับไปรายชื่อลูกค้า'));
+        back.onclick=()=>{selectedCustomer=undefined;render();};
         const card=element('section');
         card.className='customer-card';
         element('h2',customerLabel(row)+(row.balance!==undefined?t(' · เครดิต ฿')+row.balance:''),card);
@@ -578,43 +742,56 @@ async function render() {
           const link=element('a',t('เปิด URL ของลูกค้า'),card);
           Object.assign(link,{href:row.url,target:'_blank',rel:'noopener noreferrer'});
         }
-        if(!row.rentals.length) element('p',t('ไม่มีแพ็กเกจที่ต้องติดตาม'),card);
-        else {
-          const listNode=element('ul',undefined,card);
-          for(const rental of row.rentals){
-            const item=element('li',undefined,listNode);
-            const ends=new Date(rental.ends_at);
-            const remaining=Math.max(0,Math.ceil((ends-now)/86400000));
-            element('span',[accountLabel({platform:rental.platform,email:rental.account_email}),rental.profile_label,
-              rental.package_name,daysLabel(rental.package_days)].filter(Boolean).join(' · '),item);
-            const countdown=element('strong',remaining===0?t('หมดอายุแล้ว'):t('เหลือ ')+daysLabel(remaining),item);
-            countdown.className=remaining<=3?'renewal-soon':'';
-            element('small',t('หมดอายุ ')+storeDate.format(ends)+t(' น.')+(remaining>0&&remaining<=3?t(' · ควรติดต่อลูกค้าเรื่องต่ออายุ'):''),item);
-          }
-        }
         if(role==='OWNER'){
-          const details=element('details',undefined,card);
-          element('summary',t('แก้ไขข้อมูลลูกค้า'),details);
-          form(t('แก้ไข URL และชื่อเรียก'),customerContactFields(row),data=>shop('customers/'+row.id+'/contact',data),details);
+          form(t('แก้ไขข้อมูลลูกค้า'),[['name',t('ชื่อลูกค้า'),{type:'text',value:row.name,maxLength:150}],
+            ...customerContactFields(row)],data=>shop('customers/'+row.id+'/contact',data),card);
+          const panel=disclosure(card,t('จัดการเครดิต'));
+          panel.className='customer-credit';
+          form(t('ปรับเครดิตโดยไม่มีการชำระเงิน'),[
+            ['direction',t('ประเภทการปรับเครดิต'),'',[['ADD',t('เพิ่มเครดิต')],['REMOVE',t('ลดเครดิต')]]],
+            ['amount',t('จำนวนเงิน (บาท)'),{type:'number',min:.01,step:.01}],
+            ['reason',t('เหตุผล')],
+            ['confirm',t('ยืนยันการปรับเครดิตโดยไม่มีการชำระเงิน'),'checkbox']
+          ],data=>shop('customers/'+row.id+'/credit-adjustments',data),panel,t('บันทึกเครดิต'));
         }
       }
     } else if(page==='streaming-emails'){
       const emails=await shop('streaming-emails');
       if(!current()) return;
       element('h1',t('อีเมลบัญชีสตรีมมิง'));
+      const selected=emails.find(row=>row.id===selectedStreamingEmail);
+      if(selected){
+        const details=await shop('streaming-emails/'+selected.id);
+        if(!current()) return;
+        const back=element('button',t('กลับไปยังรายการอีเมล'));
+        back.onclick=()=>{selectedStreamingEmail=undefined;render();};
+        element('h2',details.email);
+        element('p',t('รหัสผ่านอีเมล')+' · '+(details.password??t(details.password_set?'ต้องตั้งรหัสผ่านอีเมลใหม่เพื่อให้ดูได้':'ยังไม่ได้ตั้งรหัสผ่านอีเมล')));
+        element('h2',t('บัญชีที่ผูกแล้ว'));
+        for(const account of details.accounts){
+          const button=element('button',platformName(account.platform));
+          button.onclick=()=>{selectedAccount=account.id;page='inventory';render();};
+        }
+        if(!details.accounts.length) element('p',t('ยังไม่ได้ผูกบัญชี'));
+        const fields=details.accounts.length?[]:[['email',t('อีเมลบัญชีจำลอง'),{type:'email',value:details.email}]];
+        fields.push(['password',t('รหัสผ่านอีเมลใหม่'),{type:'password',required:!details.password_set,minLength:12,maxLength:128,autocomplete:'new-password'}]);
+        form(t('แก้ไขข้อมูลอีเมล'),fields,data=>shop('streaming-emails/'+details.id,data));
+        form(t('ลบอีเมลและบัญชีที่ผูก'),[],async()=>{
+          await shop('streaming-emails/'+details.id+'/archive',{});
+          selectedStreamingEmail=undefined;
+        },view,t('ลบอีเมลและบัญชีที่ผูก'));
+        return;
+      }
       element('p',t('เพิ่มอีเมลและรหัสผ่านสมมติไว้เลือกตอน Bind บัญชี'));
       form(t('เพิ่มอีเมลบัญชีสตรีมมิง'),[
         ['email',t('อีเมลบัญชีจำลอง'),'email'],
         ['password',t('รหัสผ่านอีเมล'),{type:'password',minLength:12,maxLength:128,autocomplete:'new-password'}]
       ],data=>shop('streaming-emails',data),view,t('เพิ่มอีเมล'));
       for(const row of emails){
-        const details=element('details');
         const bound=row.bound_platforms.length>0;
-        element('summary',row.email+' · '+(bound?t('ผูกบัญชีแล้ว'):t('ยังไม่ได้ผูกบัญชี')),details);
-        if(!row.password_set) element('p',t('ยังไม่ได้ตั้งรหัสผ่านอีเมล'),details);
-        const fields=bound?[]:[['email',t('อีเมลบัญชีจำลอง'),{type:'email',value:row.email}]];
-        fields.push(['password',t('รหัสผ่านอีเมลใหม่'),{type:'password',required:bound||!row.password_set,minLength:12,maxLength:128,autocomplete:'new-password'}]);
-        form(t('แก้ไขข้อมูลอีเมล'),fields,data=>shop('streaming-emails/'+row.id,data),details);
+        const open=element('button',row.email+' · '+(bound?t('ผูกบัญชีแล้ว'):t('ยังไม่ได้ผูกบัญชี')));
+        open.className='inventory-account';
+        open.onclick=()=>{selectedStreamingEmail=row.id;render();};
       }
     } else if(page==='inventory'){
       const [accounts,profiles,jobs,emails]=await Promise.all([shop('accounts'),shop('profiles'),shop('bot-jobs'),shop('streaming-emails')]);
@@ -623,7 +800,7 @@ async function render() {
       const heading=element('section');
       heading.className='inventory-heading';
       const headingText=element('div',undefined,heading);
-      element('h1',account?accountLabel(account):t('บัญชีสตรีมมิง'),headingText);
+      element('h1',account?inventoryAccountLabel(account):t('บัญชีสตรีมมิง'),headingText);
       element('p',account?status[account.health]??account.health:accounts.length+t(' บัญชีที่ผูกไว้'),headingText);
       if(account){
         const back=element('button',t('กลับไปยังรายการบัญชี'),heading);
@@ -641,7 +818,18 @@ async function render() {
             [t('ต้นทุนต่อโปรไฟล์ต่อวัน'),cost.profile_daily_cost===null?'—':baht.format(cost.profile_daily_cost)]
           ]);
           form(t('ต้นทุนบัญชีสตรีมมิง'),accountCostFields(cost),data=>shop(path,data),costs,t('บันทึกต้นทุน'));
+          const removal=element('details',undefined,costs);
+          element('summary',t('ลบบัญชีสตรีมมิง'),removal);
+          form(t('ลบบัญชีสตรีมมิง'),[['confirm',t('ยืนยันนำบัญชีนี้ออกจากรายการและหยุดนับต้นทุนคงที่'),'checkbox']],
+            async data=>{
+              await shop('accounts/'+account.id+'/archive',data);
+              selectedAccount=undefined;
+            },removal,t('ลบบัญชีสตรีมมิง'));
         }
+        const [rentals,pins]=role==='OWNER'?await Promise.all([
+          shop('rentals?account_id='+account.id),shop('accounts/'+account.id+'/profile-pins')
+        ]):[[],{}];
+        if(!current()) return;
         const entries=profiles.filter(profile=>profile.account_id===account.id);
         const panel=element('section');
         panel.className='inventory-panel';
@@ -653,8 +841,10 @@ async function render() {
           const summary=element(role==='OWNER'?'summary':'div',undefined,details);
           summary.className='inventory-profile-summary';
           element('strong',profile.label,summary);
-          const info=element('span',profileStatus[profile.status]+(profile.pin_set?t(' · ตั้ง PIN แล้ว'):''),summary);
-          info.className=profile.status==='AVAILABLE'?'inventory-status ready':'inventory-status';
+          const info=element('span',(profile.is_primary?t('โปรไฟล์หลัก · ไม่เปิดให้เช่า'):profileStatus[profile.status])+
+            (role==='OWNER'?' · '+(pins[profile.id]?'PIN '+pins[profile.id]:
+              t(profile.pin_set?'ต้องตั้ง PIN ใหม่เพื่อให้ดูได้':'ยังไม่ได้ตั้ง PIN')):''),summary);
+          info.className=!profile.is_primary&&profile.status==='AVAILABLE'?'inventory-status ready':'inventory-status';
           if(role!=='OWNER') continue;
           const actions=element('div',undefined,details);
           actions.className='inventory-profile-actions';
@@ -662,14 +852,20 @@ async function render() {
           const path='accounts/'+account.id+'/profiles/'+profile.id+'/';
           form(t('แก้ไขชื่อโปรไฟล์'),[['label',t('ชื่อโปรไฟล์'),{type:'text',value:profile.label,maxLength:150}]],
             data=>shop(path+'rename',data),namePanel,t('บันทึกชื่อ'));
+          const rental=rentals.find(row=>row.profile_id===profile.id&&!row.profile_unassigned&&row.status!=='CLOSED');
+          if(rental?.release_pending) element('p',t('รอเคลียร์โปรไฟล์'),actions);
+          if(rental?.status==='ACTIVE') form(t('เคลียร์ผู้เช่า'),[['confirm',t('ยืนยันเคลียร์โปรไฟล์และเก็บวันหมดอายุเดิม'),'checkbox']],
+            data=>shop('rentals/'+rental.id+'/release-profile',{...data,profile_id:profile.id}),actions,t('เคลียร์ผู้เช่า'));
           if(profile.status==='AVAILABLE'){
             const pinPanel=element('div',undefined,actions);
             form(t('เปลี่ยน PIN จำลอง'),[
               ['pin',t('PIN ใหม่ (4 หลัก)'),{type:'password',inputMode:'numeric',minLength:4,maxLength:4,pattern:'[0-9]{4}',autocomplete:'new-password'}]
             ],data=>shop(path+'pin',data),pinPanel,t('บันทึก PIN'));
-            const removePanel=element('div',undefined,actions);
-            form(t('ลบโปรไฟล์'),[['confirm',t('ยืนยันลบ ')+profile.label,'checkbox']],
-              data=>shop(path+'archive',data),removePanel,t('ลบโปรไฟล์'));
+            if(!profile.is_primary){
+              const removePanel=element('div',undefined,actions);
+              form(t('ลบโปรไฟล์'),[['confirm',t('ยืนยันลบ ')+profile.label,'checkbox']],
+                data=>shop(path+'archive',data),removePanel,t('ลบโปรไฟล์'));
+            }
           } else element('p',t('เปลี่ยน PIN และลบได้เมื่อโปรไฟล์กลับมาพร้อมใช้งาน'),actions);
         }
         const add=element('section');
@@ -681,19 +877,16 @@ async function render() {
         const accountPanel=element('section',undefined,columns);
         accountPanel.className='inventory-panel';
         element('h2',t('บัญชีที่ผูกแล้ว'),accountPanel);
-        const buttons=element('div',undefined,accountPanel);
-        buttons.className='account-list';
-        for(const row of accounts){
-          const open=element('button',undefined,buttons);
-          open.className='inventory-account';
-          const label=accountLabel(row), state=status[row.health]??row.health;
-          open.setAttribute('aria-label',label+' · '+state);
-          const caption=element('span',undefined,open);
-          element('strong',label,caption);
-          const matching=profiles.filter(profile=>profile.account_id===row.id);
-          element('small',t('ว่าง ')+matching.filter(profile=>profile.status==='AVAILABLE').length+t(' จาก ')+matching.length+t(' โปรไฟล์'),caption);
-          element('span',state,open).className=row.health==='HEALTHY'?'inventory-status ready':'inventory-status';
-          open.onclick=()=>{selectedAccount=row.id;render();};
+        for(const [platform,group] of Map.groupBy(accounts,row=>row.platform)){
+          const section=element('section',undefined,accountPanel);
+          element('h3',platformName(platform),section);
+          const key=store+':'+platform;
+          if(!inventoryDirectories.has(key)) inventoryDirectories.set(key,{page:0,query:''});
+          directoryButtons(section,group,inventoryDirectories.get(key),row=>{selectedAccount=row.id;render();},row=>{
+            const matching=profiles.filter(profile=>profile.account_id===row.id&&!profile.is_primary);
+            const free=matching.filter(profile=>profile.status==='AVAILABLE').length;
+            return [row.email,(status[row.health]??row.health)+' · '+t('ว่าง ')+free+t(' จาก ')+matching.length+t(' โปรไฟล์')];
+          },t('ค้นหาบัญชีสตรีมมิง'),40);
         }
         if(!accounts.length) element('p',t('ยังไม่มีบัญชีสตรีมมิง'),accountPanel).className='inventory-empty';
         const bindPanel=element('section',undefined,columns);
@@ -725,6 +918,33 @@ async function render() {
       element('summary',t('รายละเอียดขั้นสูง'),details);
       list(jobs.items.filter(job=>!account||job.account_id===account.id),
         row=>t(workerJobLabels[row.type]??row.type)+' · '+(status[row.status]??t(workerStatusLabels[row.status]??row.status)),details);
+    } else if(page==='wallet-log'){
+      element('h1',t('บันทึกเงินเข้าออก'));
+      const label=element('label',t('วันที่'));
+      const picker=element('input',undefined,label);
+      Object.assign(picker,{type:'date',value:storeDay.format(new Date())});
+      const report=element('section');
+      const kinds={PAYMENT:t('ชำระเงินเข้าเครดิต'),ORDER:t('ใช้เครดิตซื้อแพ็กเกจ'),
+        MANUAL_NO_PAYMENT:t('ปรับเครดิตโดยไม่มีการชำระเงิน'),RENTAL_CANCEL_CREDIT:t('คืนเครดิตจากการยกเลิก')};
+      async function loadLog(){
+        report.replaceChildren();
+        const day=picker.value;
+        if(!day) return;
+        try{
+          const log=await shop('wallet-log/'+day);
+          if(!current()||picker.value!==day) return;
+          financialMetrics(report,[[t('เครดิตเข้า'),baht.format(log.credit_in)],[t('เครดิตออก'),baht.format(log.credit_out)]]);
+          if(!log.entries.length) element('p',t('ยังไม่มีรายการ'),report);
+          else summaryTable(report,[t('เวลา'),t('ลูกค้า'),t('ประเภท'),t('รายละเอียด'),t('เครดิตเข้า'),t('เครดิตออก'),t('เลขอ้างอิง')],
+            log.entries.map(row=>[storeDate.format(new Date(row.occurred_at)),customerLabel({name:row.customer,alias:row.alias}),
+              kinds[row.kind], [row.detail,row.actor].filter(Boolean).join(' · ')||'—',
+              Number(row.amount)>0?baht.format(row.amount):'—',Number(row.amount)<0?baht.format(-row.amount):'—',row.reference]));
+        }catch(error){
+          if(current()&&picker.value===day) element('p',error.message,report);
+        }
+      }
+      picker.onchange=loadLog;
+      await loadLog();
     } else if(page==='finance'){
       const [customers,payments,transfers]=await Promise.all([shop('customers'),shop('payment-requests'),shop('transfers')]);
       if(!current()) return;
@@ -756,11 +976,8 @@ async function render() {
         },view,t('สร้างออเดอร์'));
         const service=orderForm.elements.platform;
         const packagePicker=orderForm.elements.package_id;
-        const confirm=orderForm.elements.confirm;
         const submit=orderForm.querySelector('button');
         const updateConfirmation=()=>{
-          confirm.checked=false;
-          confirm.disabled=!packagePicker.value;
           submit.disabled=!packagePicker.value;
         };
         const showPackages=()=>{
@@ -807,28 +1024,94 @@ async function render() {
       updateQueue(orders);
       orderPoll=setTimeout(refreshOrders,3000);
     } else if(page==='rentals'){
-      const [rentals,customers,packages]=await Promise.all([
-        shop('rentals'),role==='OWNER'?shop('customers'):[],role==='OWNER'?shop('packages'):[]
+      const [rentals,packages]=await Promise.all([
+        shop('rentals'),role==='OWNER'?shop('packages'):[]
       ]);
       if(!current()) return;
       element('h1',t('การเช่า'));
-      list(rentals,row=>(status[row.status]??row.status)+t(' · ถึง ')+storeDate.format(new Date(row.ends_at)));
-      if(role==='OWNER') for(const rental of rentals.filter(row=>row.status==='ACTIVE'&&Date.parse(row.ends_at)>Date.now())){
-        const details=element('details');
+      const grouped=Map.groupBy(rentals.filter(row=>row.status!=='CLOSED'),row=>row.customer_id);
+      const groups=[...grouped.values()].sort((a,b)=>a[0].customer_name.localeCompare(b[0].customer_name,locale()));
+      if(!groups.length) element('p',t('ยังไม่มีรายการ'));
+      for(const group of groups){
+        const customer=group[0];
+        const customerPanel=element('details');
+        customerPanel.className='inventory-profile';
+        const heading=element('summary',undefined,customerPanel);
+        heading.className='inventory-profile-summary';
+        element('strong',customerLabel({name:customer.customer_name,alias:customer.customer_alias}),heading);
+        element('span',group.length+t(' รายการ'),heading);
+        for(const rental of group){
+        const details=element('section',undefined,customerPanel);
+        details.className='rental-entry';
         const original=packages.find(row=>row.id===rental.package_id);
-        const customer=customers.find(row=>row.id===rental.customer_id);
-        element('summary',(customer?customerLabel(customer)+' · ':'')+t('จัดการการเช่า · ถึง ')+storeDate.format(new Date(rental.ends_at)),details);
+        element('h2',[platformName(rental.platform),rental.package_name,rental.profile_label].filter(Boolean).join(' · '),details);
+        if(rental.account_email) element('p',accountLabel({platform:rental.platform,email:rental.account_email}),details);
+        element('p',(status[rental.status]??rental.status)+t(' · ถึง ')+storeDate.format(new Date(rental.ends_at)),details);
+        const daysLeft=rental.remaining_days;
+        if(rental.status==='ACTIVE') element('p',daysLeft?t('เหลือ ')+daysLabel(daysLeft):t('หมดอายุแล้ว'),details);
+        if(rental.cancellation_requested) element('p',t('รอถอนสิทธิ์เพื่อคืนเครดิต'),details);
+        if(rental.release_pending) element('p',t('รอเคลียร์โปรไฟล์'),details);
+        const rentalPath='rentals/'+rental.id+'/';
+        if(role==='OWNER'&&rental.status==='ACTIVE'&&!rental.assignment_pending){
+          const manage=disclosure(details,t('จัดการจำนวนวัน'));
+          const edit=form(t('เพิ่มหรือลดวันเช่า'),[
+            ['direction',t('การปรับจำนวนวัน'),'', [['ADD',t('เพิ่มวันเช่า')],['REMOVE',t('ลดวันเช่า')]]],
+            ['days',t('จำนวนวัน'),{type:'number',min:1,max:3650,step:1}]
+          ],data=>shop(rentalPath+'adjust-days',{...data,days:Number(data.days),expected_ends_at:rental.ends_at}),manage,t('บันทึกจำนวนวัน'));
+          edit.elements.direction.onchange=()=>{
+            const reducing=edit.elements.direction.value==='REMOVE';
+            edit.elements.days.max=reducing?daysLeft:3650;
+            edit.querySelector('button').disabled=reducing&&!daysLeft;
+          };
+          element('p',t('ลดวันจนเหลือ 0 วันจะยกเลิกการเช่าโดยไม่คืนเครดิต'),manage);
+        }
+        if(role==='OWNER'&&!rental.cancellation_requested){
+          const cancel=disclosure(details,t('ยกเลิกการเช่า'));
+          form(t('ยกเลิกโดยไม่คืนเครดิต'),[],()=>shop(rentalPath+'cancel',{refund:false}),cancel,t('ยกเลิกโดยไม่คืนเครดิต'));
+          if(rental.status==='ACTIVE'&&daysLeft&&!rental.assignment_pending){
+            const quotePanel=element('div',undefined,cancel);
+            cancel.ontoggle=async()=>{
+              if(!cancel.open) return;
+              quotePanel.replaceChildren();
+              try{
+                const quote=await shop(rentalPath+'cancel-quote');
+                if(!quotePanel.isConnected||!cancel.open) return;
+                const refund=t('ยกเลิกและคืนเครดิต ')+baht.format(quote.credit_amount);
+                element('p',t('วันคงเหลือที่คิดคืนเครดิต ')+daysLabel(quote.remaining_days),quotePanel);
+                form(refund,[],()=>shop(rentalPath+'cancel',{refund:true,expected_credit:quote.credit_amount}),quotePanel,refund);
+              }catch(error){
+                if(quotePanel.isConnected&&cancel.open) element('p',error.message,quotePanel);
+              }
+            };
+          }
+        }
+        if(rental.profile_unassigned){
+          element('p',t(rental.assignment_pending?'กำลังส่งมอบโปรไฟล์ใหม่':'ยังไม่ได้จัดสรรโปรไฟล์'),details);
+          if(role==='OWNER'&&!rental.assignment_pending&&daysLeft){
+            const open=disclosure(details,t('จัดสรรโปรไฟล์ใหม่'));
+            const panel=element('div',undefined,open);
+            open.ontoggle=async()=>{
+              if(!open.open) return;
+              panel.replaceChildren();
+              try {
+                const accounts=await shop(rentalPath+'replacement');
+                if(open.open&&panel.isConnected) replacementForm(panel,rental,accounts);
+              }
+              catch(error){notice(error.message);}
+            };
+          }
+          continue;
+        }
+        if(role!=='OWNER'||rental.status!=='ACTIVE'||Date.parse(rental.ends_at)<=Date.now()) continue;
         const extend=(action,data)=>shop('rentals/'+rental.id+'/'+action,{...data,expected_ends_at:rental.ends_at});
+        const actions=element('details',undefined,details);
+        element('summary',t('ต่ออายุ'),actions);
         if(original) form(t('ต่ออายุด้วยแพ็กเกจเดิม'),[
           ['package_id',t('แพ็กเกจเดิม'),'',[['',t('เลือกแพ็กเกจเดิม')],[original.id,packageLabel(original)]]],
           ['confirm',t('ยืนยันการใช้เครดิตตามราคาแพ็กเกจ'),'checkbox']
-        ],data=>extend('renew',{...data,amount:original.amount,days:original.days}),details,t('ต่ออายุ'));
-        else element('p',t('รายการเช่านี้ไม่มีแพ็กเกจเดิมสำหรับต่ออายุ'),details);
-        form(t('สร้างออเดอร์ชดเชย'),[
-          ['days',t('จำนวนวันเพิ่ม'),{type:'number',min:1,max:365,step:1}],
-          ['reason',t('เหตุผลการชดเชย')],
-          ['confirm',t('ยืนยันชดเชยโดยไม่หักเครดิต'),'checkbox']
-        ],data=>extend('compensate',{...data,days:Number(data.days)}),details,t('สร้างออเดอร์ชดเชย'));
+        ],data=>extend('renew',{...data,amount:original.amount,days:original.days}),actions,t('ต่ออายุ'));
+        else element('p',t('รายการเช่านี้ไม่มีแพ็กเกจเดิมสำหรับต่ออายุ'),actions);
+        }
       }
     } else if(page==='owner-settings'){
       const send=(path,data)=>store?shop(path,data):request('owner/'+path,data);
@@ -859,7 +1142,11 @@ async function render() {
   } catch(error){ if(current()) notice(error.message); }
 }
 function selectStore(id) {
-  if(store!==id) selectedAccount=undefined;
+  if(store!==id){
+    selectedAccount=selectedCustomer=undefined;
+    customerDirectory.page=0;
+    customerDirectory.query='';
+  }
   store=id;
   role=identity.stores.find(row=>row.id===id)?.role;
   byId('user-level').textContent=identity.is_super?'Super Admin':identity.is_admin?'Admin':userLevels[role]??(identity.is_owner?'Owner':t('บัญชีผู้ใช้'));
@@ -872,6 +1159,28 @@ function selectStore(id) {
   profile.title=identity.is_super?t('ตั้งค่า Super Admin'):identity.is_admin?t('ตั้งค่า Admin'):t('ตั้งค่า Owner');
   profile.setAttribute('aria-label',profile.title);
 }
+function updateBell(){
+  const bell=byId('request-bell');
+  bell.hidden=!session||!(identity?.is_super||identity?.is_admin);
+  const badge=byId('request-count');
+  badge.hidden=!pendingRequests;
+  badge.textContent=pendingRequests>99?'99+':String(pendingRequests);
+  bell.setAttribute('aria-label',t('คำขอเปิดร้านที่รออนุมัติ')+(pendingRequests?' ('+pendingRequests+')':''));
+}
+async function refreshBell(){
+  const activeSession=session;
+  if(!activeSession||!(identity?.is_super||identity?.is_admin)) return;
+  clearTimeout(bellPoll);
+  const version=++bellVersion;
+  try {
+    const {count}=await request('admin/store-requests/pending-count');
+    if(session===activeSession&&version===bellVersion){pendingRequests=count;updateBell();}
+  } catch {
+    // Preserve the last count when the API is temporarily unavailable.
+  }
+  if(session===activeSession&&version===bellVersion) bellPoll=setTimeout(refreshBell,15000);
+}
+byId('request-bell').onclick=()=>{page='requests';render();};
 function syncLanguage() {
   document.documentElement.lang=getLanguage();
   baht=new Intl.NumberFormat(locale(),{style:'currency',currency:'THB',currencyDisplay:'narrowSymbol'});
@@ -883,6 +1192,7 @@ function syncLanguage() {
   toggle.setAttribute('aria-label',t('เปลี่ยนภาษา')+' · '+toggle.textContent);
   if(session&&identity) selectStore(store);
   else byId('user-level').textContent=t('บัญชีผู้ใช้');
+  updateBell();
 }
 byId('language-switch').onclick=()=>{
   setLanguage(getLanguage()==='th'?'en':'th');
@@ -902,9 +1212,11 @@ byId('credentials').onsubmit=async event=>{
     if(!identity.is_super&&!identity.is_admin&&!identity.is_owner&&!identity.stores.length) throw new Error(t('บัญชีนี้ยังไม่ได้รับสิทธิ์เข้าร้าน'));
     form.reset();
     selectStore(identity.stores[0]?.id);
-    page=identity.is_super?'home':identity.is_admin?'requests':store?'home':'owner-settings';
+    page=identity.is_super?'home':identity.is_admin?'request-history':store?'home':'owner-settings';
     byId('login').hidden=true;
     byId('workspace').hidden=false;
+    updateBell();
+    refreshBell();
     await render();
   }catch(error){session=undefined;notice(error.message);}
   finally{button.disabled=false;}
@@ -932,8 +1244,14 @@ byId('logout').onclick=async()=>{
   try {await request('logout',{});} catch(error){notice(error.message);return;}
   ++renderId;
   clearTimeout(orderPoll);
+  clearTimeout(bellPoll);
   session=undefined;
-  selectedAccount=undefined;
+  pendingRequests=0;
+  historyPage=0;
+  updateBell();
+  selectedAccount=selectedCustomer=undefined;
+  customerDirectory.page=0;
+  customerDirectory.query='';
   adminOwnerId=undefined;
   adminShopId=undefined;
   ownerDirectory.page=shopDirectory.page=0;

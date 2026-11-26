@@ -7,6 +7,9 @@ header:has(#owner-settings:not([hidden])) {padding-right:max(4.5rem,calc((100vw 
 header span {background:#ffdf9b;color:#382605;padding:.2rem .7rem;border-radius:.4rem;font-size:.92rem}
 #language-switch {margin-inline-start:auto;min-height:2.1rem;background:transparent;border-color:#a8c7bc;padding:.2rem .65rem}
 #language-switch:hover {background:#236952}
+#request-bell {position:relative;display:grid;place-items:center;min-width:2.3rem;min-height:2.2rem;padding:.25rem;background:transparent;border-color:#a8c7bc}
+#request-bell:hover {background:#236952}
+#request-count {position:absolute;top:-.45rem;right:-.4rem;border-radius:2rem;background:#ffdf9b;color:#382605;font-size:.75rem;padding:0 .28rem;min-width:1rem}
 main {max-width:68rem;margin:auto;padding:1rem}
 h1 {margin:.3rem 0 1rem}
 h2 {font-size:1.15rem}
@@ -30,6 +33,8 @@ details {margin-top:.8rem}
 .allocation-accounts {border:1px solid #acc8bf;border-radius:.45rem;min-width:0}
 .allocation-accounts label {display:flex;align-items:center;gap:.5rem;overflow-wrap:anywhere}
 .allocation-accounts input {min-height:auto;flex:none}
+.allocation-accounts button {overflow-wrap:anywhere}
+.allocation-accounts button[aria-pressed="true"] {background:#e3f2e9;color:#13443a;border-color:#418675}
 .sales-metrics {display:grid;grid-template-columns:repeat(auto-fit,minmax(8rem,1fr));gap:.6rem;margin-bottom:1rem}
 .sales-metrics div {background:#ecf5f1;border-radius:.45rem;padding:.65rem .8rem}
 .sales-metrics strong {display:block;font-size:1.15rem}
@@ -39,6 +44,9 @@ details {margin-top:.8rem}
 .sales-table th:nth-last-child(-n+3),.sales-table td:nth-last-child(-n+3) {text-align:right}
 .customer-card {border-top:1px solid #cbdad5;padding:.65rem 0}
 .customer-card li > * {display:block}
+.customer-credit {margin:.55rem 0}
+.rental-entry {padding:.85rem 1rem;border-top:1px solid #d5e3dd}
+.rental-entry h2,.rental-entry p {margin:.2rem 0 .55rem}
 .renewal-soon {color:#9d4f02}
 #view.owner-overview {padding:0;border:0;background:transparent;display:grid;gap:1.35rem}
 .overview-hero {position:relative;overflow:hidden;isolation:isolate;color:#fff;padding:clamp(1.4rem,4vw,2.75rem);border-radius:1.35rem;background:linear-gradient(112deg,#103632 0%,#16554a 70%,#236952)}
@@ -116,5 +124,25 @@ details {margin-top:.8rem}
 .directory-search {max-width:22rem}
 .directory-pagination {display:flex;align-items:center;gap:.65rem;margin:.7rem 0;flex-wrap:wrap}
 .directory-pagination button:disabled {cursor:default}
+main details > summary, .customer-card a {
+  box-sizing:border-box;
+  width:100%;
+  max-width:100%;
+  min-height:2.6rem;
+  margin:.35rem 0;
+  padding:.4rem .85rem;
+  border:1px solid #418675;
+  border-radius:.45rem;
+  background:#1c6052;
+  color:white;
+  font-weight:650;
+  cursor:pointer;
+}
+main details > summary:hover, .customer-card a:hover {background:#164f43}
+main details[open] > summary {background:#e6f3ec;color:#164f43}
+.inventory-profile:not([open]) > summary::after {border-color:white}
+.customer-card a {width:fit-content}
+main details > .inventory-profile-summary {width:100%;margin:0}
+.customer-card a {display:inline-flex;align-items:center;text-decoration:none}
 @media(max-width:760px) { .inventory-columns,.inventory-profile-actions {grid-template-columns:1fr} }
 

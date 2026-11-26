@@ -24,6 +24,7 @@ services:
     build: .
     environment:
       DATABASE_URL: postgres://stream_app:local_runtime_only@postgres/postgres
+      PROFILE_PIN_KEY: ${PROFILE_PIN_KEY:-}
       HOST: 0.0.0.0
     ports:
       - "127.0.0.1:${API_LOCAL_PORT:-3000}:3000"
@@ -40,6 +41,7 @@ services:
     command: ["npm", "run", "worker"]
     depends_on:
       - api
+
 volumes:
   phase1:
 

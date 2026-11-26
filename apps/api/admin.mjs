@@ -3,6 +3,7 @@ import { uuid } from './jobs.mjs';
 
 const eligibleOwners=`NOT u.is_super AND NOT u.is_admin AND u.active AND (
   EXISTS (SELECT 1 FROM memberships m WHERE m.user_id=u.id AND m.role='OWNER')
+  OR EXISTS (SELECT 1 FROM admin_audit a WHERE a.subject_id=u.id AND a.action='OWNER_CREATED')
   OR NOT EXISTS (SELECT 1 FROM memberships m WHERE m.user_id=u.id)
 )`;
 const isOwner=`EXISTS (SELECT 1 FROM memberships WHERE user_id=$1 AND role='OWNER')
@@ -72,14 +73,15 @@ export function registerAdmin(app, secured) {
     if (!auth.is_super) reject(403,'FORBIDDEN');
     return (await q(`SELECT u.id,u.username,u.active,
       (SELECT count(*)::int FROM memberships m WHERE m.user_id=u.id AND m.role='OWNER') AS store_count
-      FROM users u WHERE (${eligibleOwners}) OR EXISTS (
-        SELECT 1 FROM memberships m WHERE m.user_id=u.id AND m.role='OWNER')
+      FROM users u WHERE u.removed_at IS NULL AND ((${eligibleOwners}) OR EXISTS (
+        SELECT 1 FROM memberships m WHERE m.user_id=u.id AND m.role='OWNER') OR EXISTS (
+        SELECT 1 FROM admin_audit a WHERE a.subject_id=u.id AND a.action='OWNER_CREATED'))
       ORDER BY u.username,u.id`)).rows;
   });
   secured('GET','/v1/admin/owners/:ownerId/overview',async(q,auth,{params:{ownerId}})=>{
     if (!auth.is_super) reject(403,'FORBIDDEN');
     const {rows:[owner]}=await q(`SELECT id,username,public.admin_monthly_account_cost(id,NULL,$2) AS monthly_cost
-      FROM users WHERE id=$1 AND NOT is_super AND NOT is_admin AND (${isOwner})`,[ownerId,auth.token]);
+      FROM users WHERE id=$1 AND removed_at IS NULL AND NOT is_super AND NOT is_admin AND (${isOwner})`,[ownerId,auth.token]);
     if (!owner) reject(404,'NOT_FOUND');
     return owner;
   });
@@ -115,6 +117,16 @@ export function registerAdmin(app, secured) {
     await q('SELECT id FROM admin_guard FOR UPDATE');
     const {rows:[actor]} = await q('SELECT active,password_hash FROM users WHERE id=$1 FOR UPDATE',[auth.id]);
     if (!actor?.active || !await matches(password,actor.password_hash)) reject(403,'REAUTH_REQUIRED');
+  }
+  for (const [directory,kind] of [['owners','OWNER'],['admins','ADMIN']]) {
+    secured('POST','/v1/admin/'+directory+'/:userId/remove',async(q,auth,{body,params:{userId}})=>{
+      await confirm(q,auth,body?.current_password);
+      if (body.confirm!==true) reject(400,'CONFIRM_REQUIRED');
+      if (!uuid.test(userId)) reject(400,'INVALID_ID');
+      const {rows:[result]}=await q('SELECT public.remove_platform_user($1,$2,$3) AS removed',[userId,kind,auth.token]);
+      if (!result.removed) reject(404,'NOT_FOUND');
+      return {ok:true};
+    });
   }
   secured('GET','/v1/admin/admins',async(q,auth) => {
     if (!auth.is_super) reject(403,'FORBIDDEN');
@@ -183,10 +195,19 @@ export function registerAdmin(app, secured) {
     if (owned.rowCount) reject(409,'USE_ACTIVE_STORE');
     return createStoreRequest(q,auth.id,body?.name);
   });
-  secured('GET','/v1/admin/store-requests',async(q,auth) => {
+  secured('GET','/v1/admin/store-requests/pending-count',async(q,auth) => {
     if (!auth.is_super&&!auth.is_admin) reject(403,'FORBIDDEN');
-    return (await q(`SELECT r.id,r.name,r.status,u.username FROM store_creation_requests r
-      JOIN users u ON u.id=r.requester_id ORDER BY (r.status='PENDING') DESC,r.created_at DESC,r.id LIMIT 100`)).rows;
+    return (await q("SELECT count(*)::int AS count FROM store_creation_requests WHERE status='PENDING'")).rows[0];
+  });
+  secured('GET','/v1/admin/store-requests',async(q,auth,{query}) => {
+    if (!auth.is_super&&!auth.is_admin) reject(403,'FORBIDDEN');
+    const scope=query.scope??'all', page=Number(query.page??0);
+    if (!['all','pending','history'].includes(scope)||!Number.isSafeInteger(page)||page<0||page>100000) reject(400,'INVALID_INPUT');
+    return (await q(`SELECT r.id,r.name,r.status,u.username,reviewer.username AS reviewer,r.reviewed_at
+      FROM store_creation_requests r JOIN users u ON u.id=r.requester_id LEFT JOIN users reviewer ON reviewer.id=r.reviewer_id
+      WHERE ($1='all' OR ($1='pending' AND r.status='PENDING') OR ($1='history' AND r.status<>'PENDING'))
+      ORDER BY (r.status='PENDING') DESC,coalesce(r.reviewed_at,r.created_at) DESC,r.id LIMIT $2 OFFSET $3`,
+      [scope,scope==='history'?36:100,scope==='history'?page*35:0])).rows;
   });
   secured('POST','/v1/admin/store-requests/:requestId/review',async(q,auth,{body,params:{requestId}}) => {
     await confirm(q,auth,body?.current_password,true);

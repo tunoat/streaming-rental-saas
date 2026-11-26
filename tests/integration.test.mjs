@@ -23,6 +23,7 @@ async function ok(method,path,auth,body,expected=200,key) {
 before(async()=>{
   if (!enabled) return;
   process.env.BOT_LEASE_SECONDS='15';
+  process.env.PROFILE_PIN_KEY=randomBytes(32).toString('hex');
   ({pool}=await import('../apps/api/db.mjs'));
   const {appServer}=await import('../apps/api/server.mjs');
   const {passwordHash,digest}=await import('../apps/api/db.mjs');
@@ -102,7 +103,7 @@ integration('owner can approve mock credit and allocate verified inventory to mo
   const credential={platform:'netflix',email:uid()+'@example.invalid',password:'Demo-Bind-Only!'};
   await ok('POST',route+'streaming-emails',owner,{email:credential.email,password:'short'},400);
   const email=await ok('POST',route+'streaming-emails',owner,{email:credential.email,password:credential.password});
-  const binding={platform:'netflix',email_id:email.id,otp:'123456',profile_count:1,broker_amount:'0',subscription_amount:'0'};
+  const binding={platform:'netflix',email_id:email.id,otp:'123456',profile_count:2,broker_amount:'0',subscription_amount:'0'};
   assert.deepEqual(await ok('GET',storePath(B)+'streaming-emails',outsider),[]);
   await ok('POST',storePath(B)+'accounts',outsider,binding,400);
   await ok('POST',route+'accounts',owner,{...binding,platform:'other'},400);
@@ -119,7 +120,11 @@ integration('owner can approve mock credit and allocate verified inventory to mo
   await ok('POST',route+'streaming-emails/'+email.id,owner,{password:'Updated-Demo-Mail-Password!'});
   await ok('POST',route+'accounts',owner,binding,409);
   const profiles=await ok('GET',route+'profiles',owner);
-  assert.deepEqual(profiles.map(({account_id,label})=>({account_id,label})),[{account_id:account.id,label:'profile1'}]);
+  assert.deepEqual(profiles.map(({label,is_primary})=>[label,is_primary]),[['profile1',true],['profile2',false]]);
+  const [primary,rentable]=profiles;
+  const primaryPath=route+'accounts/'+account.id+'/profiles/'+primary.id+'/';
+  await ok('POST',primaryPath+'archive',owner,{confirm:true},409);
+  await ok('POST',primaryPath+'rename',owner,{label:'Main profile'});
   const request=await ok('POST',route+'payment-requests',owner,{customer_id:customer.id,amount:'100'});
   const transfer=await ok('POST',route+'transfers',owner,{payment_id:request.id,amount:'100',evidence:'mock-'+uid()});
   await ok('POST',route+'transfers/'+transfer.id+'/approve',owner,{confirm:true});
@@ -144,13 +149,25 @@ integration('owner can approve mock credit and allocate verified inventory to mo
   await ok('POST',route+'accounts/'+other.id+'/profiles/'+otherProfile.id+'/archive',owner,{confirm:true});
   const [unverified]=await ok('GET',route+'allocation-accounts',owner);
   assert.deepEqual([unverified.id,unverified.available_profiles,unverified.accepts_waiting_order],[account.id,1,false]);
+  assert.equal(unverified.blocked_reason,'NOT_VERIFIED');
   await ok('POST',route+'allocate',owner,{account_id:account.id},409);
   await ok('POST',route+'bot-jobs',owner,{type:'VERIFY_SUBSCRIPTION',reason:'Demo check',account_id:account.id},201);
   await runMock();
   const [available]=await ok('GET',scoped,owner);
   assert.deepEqual([available.id,available.available_profiles,available.accepts_waiting_order],[account.id,1,true]);
+  assert.equal(available.blocked_reason,null);
+  const {rows:[verification]}=await db.query('SELECT checked_at,subscription_until FROM accounts WHERE (store_id,id)=($1,$2)',[A,account.id]);
+  await db.query("UPDATE accounts SET checked_at=now()-interval '25 hours' WHERE (store_id,id)=($1,$2)",[A,account.id]);
+  assert.equal((await ok('GET',scoped,owner))[0].blocked_reason,'CHECK_EXPIRED');
+  await db.query("UPDATE accounts SET checked_at=$3,subscription_until=now()+interval '1 day' WHERE (store_id,id)=($1,$2)",[A,account.id,verification.checked_at]);
+  const [short]=await ok('GET',scoped,owner);
+  assert.equal(short.blocked_reason,'SUBSCRIPTION_TOO_SHORT');
+  assert.ok(Date.parse(short.required_until)>Date.parse(short.subscription_until));
+  await db.query('UPDATE accounts SET subscription_until=$3 WHERE (store_id,id)=($1,$2)',[A,account.id,verification.subscription_until]);
+  assert.deepEqual(available.profiles,[{id:rentable.id,label:'profile2'}]);
+  await ok('POST',route+'allocate',owner,{order_id,account_id:account.id,profile_id:primary.id},409);
   await ok('POST',route+'allocate',owner,{account_id:uid()},409);
-  await ok('POST',route+'allocate',owner,{order_id,account_id:account.id});
+  await ok('POST',route+'allocate',owner,{order_id,account_id:account.id,profile_id:rentable.id});
   assert.equal((await ok('GET',route+'orders?scope=active',owner)).find(row=>row.id===order_id).status,'DELIVERING');
   const beforeDelivery=await ok('GET',route+'owner-overview',owner);
   assert.deepEqual(beforeDelivery.backlog,[{platform:'netflix',days:2,name:'Two day test',waiting:0,delivering:1}]);
@@ -212,7 +229,7 @@ integration('renewal uses the original package and compensation extends the same
   assert.equal(summary.name,'Demo customer');
   assert.ok(!Object.hasOwn(summary,'balance'));
   const [entry]=summary.rentals;
-  assert.deepEqual([entry.id,entry.platform,entry.profile_label,entry.package_days],[rental.id,'netflix','profile1',2]);
+  assert.deepEqual([entry.id,entry.platform,entry.profile_label,entry.package_days],[rental.id,'netflix','profile2',2]);
   assert.equal(Date.parse(entry.ends_at),Date.parse(extended.ends_at));
   await ok('GET',path+'customer-renewals',outsider,undefined,403);
 });
@@ -228,11 +245,11 @@ integration('uncertain revocation holds profile and schedules a reconciliation j
   const result=await client.report(claim.job.id,{...lease,observed_at,outcome:'INCONCLUSIVE',
     error_code:'ACCESS_NOT_REVOKED',evidence:{kind:'MOCK',source:'mock-provider',reference:'mock-'+uid(),observed_at}});
   assert.equal(result.status,'RECONCILING');
-  assert.equal((await ok('GET',path+'profiles',owner))[0].status,'HELD');
+  assert.equal((await ok('GET',path+'profiles',owner)).find(row=>row.label==='profile2').status,'HELD');
   assert.equal((await ok('GET',path+'rentals',owner))[0].status,'REVOCATION_PENDING');
   assert.equal((await runMock()).type,'RECONCILE_REVOCATION');
   assert.equal((await ok('GET',path+'rentals',owner))[0].status,'CLOSED');
-  assert.equal((await ok('GET',path+'profiles',owner))[0].status,'AVAILABLE');
+  assert.equal((await ok('GET',path+'profiles',owner)).find(row=>row.label==='profile2').status,'AVAILABLE');
 });
 integration('prod startup rejects mock application before constructing routes',async()=>{
   const {appServer}=await import('../apps/api/server.mjs');
@@ -334,8 +351,8 @@ integration('customer aliases and URLs can be saved, cleared and accessed only w
   await ok('POST',storePath(B)+contact,outsider,{alias:'Other store',url:''},404);
   const saved=(await ok('GET',path+'customers',owner)).find(row=>row.id===customer.id);
   assert.equal(saved.alias,'น้องเอ');
-  const cleared=await ok('POST',path+contact,owner,{alias:'',url:''});
-  assert.deepEqual([cleared.alias,cleared.url],[null,null]);
+  const cleared=await ok('POST',path+contact,owner,{name:'Renamed customer',alias:'',url:''});
+  assert.deepEqual([cleared.name,cleared.alias,cleared.url],['Renamed customer',null,null]);
 });
 integration('Super Admin can suspend and reactivate a store and adjust its Bangkok expiry',async()=>{
   const path='/v1/admin/stores/'+A+'/';
@@ -425,11 +442,20 @@ integration('delegated Admin can create an Owner and approve a first store but c
   assert.equal(before.is_owner,true);
   assert.deepEqual(before.stores,[]);
   const requested=await ok('POST','/v1/owner/store-requests',firstOwner,{name:'First store'});
-  const requests=await ok('GET','/v1/admin/store-requests',delegated);
+  const {count}=await ok('GET','/v1/admin/store-requests/pending-count',delegated);
+  await ok('GET','/v1/admin/store-requests/pending-count',firstOwner,undefined,403);
+  const requests=await ok('GET','/v1/admin/store-requests?scope=pending',delegated);
   assert.ok(requests.some(row=>row.id===requested.id));
+  assert.ok(requests.every(row=>row.status==='PENDING'));
   const review='/v1/admin/store-requests/'+requested.id+'/review';
   await ok('POST',review,delegated,{status:'REJECTED',current_password:password},403);
   const approved=await ok('POST',review,delegated,{status:'APPROVED',current_password:password});
+  assert.equal((await ok('GET','/v1/admin/store-requests/pending-count',delegated)).count,count-1);
+  const history=await ok('GET','/v1/admin/store-requests?scope=history&page=0',delegated);
+  const reviewed=history.find(row=>row.id===requested.id);
+  assert.deepEqual([reviewed.status,reviewed.reviewer],['APPROVED',secondAdmin.username]);
+  assert.ok(reviewed.reviewed_at);
+  assert.ok(history.every(row=>row.status!=='PENDING'));
   const after=await ok('GET','/v1/me',firstOwner);
   assert.ok(after.stores.some(store=>store.id===approved.store_id&&store.role==='OWNER'));
 });
@@ -437,10 +463,11 @@ integration('monthly fixed fees and daily order profit use the two cost componen
   const path=storePath(B);
   async function addAccount(target,profile_count,broker_amount,subscription_amount) {
     const email=await ok('POST',target+'streaming-emails',outsider,{email:uid()+'@example.invalid',password:'Demo-Mail-Only!'});
-    return ok('POST',target+'accounts',outsider,{platform:'netflix',email_id:email.id,otp:'123456',profile_count,broker_amount,subscription_amount});
+    const account=await ok('POST',target+'accounts',outsider,{platform:'netflix',email_id:email.id,otp:'123456',profile_count,broker_amount,subscription_amount});
+    return {...account,email_id:email.id};
   }
-  const netflix=await addAccount(path,4,'20','400');
-  await addAccount(path,1,'0','199');
+  const netflix=await addAccount(path,5,'20','400');
+  const idle=await addAccount(path,1,'0','199');
   const costPath=path+'accounts/'+netflix.id+'/cost';
   await ok('GET',costPath,owner,undefined,403);
   const rate=await ok('GET',costPath,outsider);
@@ -473,6 +500,10 @@ integration('monthly fixed fees and daily order profit use the two cost componen
   const thirtyDays=await ok('POST',path+'orders',outsider,{customer_id:oneDay.customer_id,package_id:plan.id,amount:'179',days:30,confirm:true});
   for(const order_id of [oneDay.id,thirtyDays.id]){
     const job=await ok('POST',path+'allocate',outsider,{order_id,account_id:netflix.id});
+    const [day]=await ok('GET',path+'monthly-sales',outsider);
+    const line=(await ok('GET',path+'monthly-sales/'+day.day,outsider)).find(row=>row.order_id===order_id);
+    const expected=order_id===oneDay.id?['3.50','11.50']:['105.00','74.00'];
+    assert.deepEqual([line.status,line.cost,line.profit],['DELIVERING',...expected]);
     await complete('DELIVER_ACCESS',job.job_id);
   }
   await ok('POST',costPath,outsider,{broker_amount:'50',subscription_amount:'449'});
@@ -495,5 +526,197 @@ integration('monthly fixed fees and daily order profit use the two cost componen
   await addAccount(otherPath,2,'10','40');
   const rollup=(await ok('GET','/v1/admin/owners/'+user_id+'/overview',admin)).monthly_cost;
   assert.deepEqual(rollup,{month:initial.month,total:'748.00',income:'371.00',configured:3,unconfigured:0});
+  const archive=account=>path+'accounts/'+account.id+'/archive';
+  await ok('POST',archive(netflix),outsider,{confirm:true},409);
+  await ok('POST',archive(idle),owner,{confirm:true},403);
+  await ok('POST',archive(idle),outsider,{},400);
+  await ok('POST',archive(idle),outsider,{confirm:true});
+  for(const endpoint of ['accounts','allocation-accounts','profiles']){
+    const rows=await ok('GET',path+endpoint,outsider);
+    assert.ok(rows.every(row=>row.id!==idle.id&&row.account_id!==idle.id));
+  }
+  await ok('GET',path+'accounts/'+idle.id+'/cost',outsider,undefined,404);
+  const after=(await ok('GET',path+'owner-overview',outsider)).monthly_cost;
+  assert.deepEqual(after,{...monthly,total:'499.00',configured:1});
+  const rental=(await ok('GET',path+'rentals',outsider)).find(row=>row.order_id===thirtyDays.id);
+  await db.query("UPDATE rental_service_periods SET starts_at=now()-interval '1 day' WHERE (store_id,order_id)=($1,$2)",[B,thirtyDays.id]);
+  await db.query(`UPDATE rentals r SET starts_at=p.starts_at FROM rental_service_periods p
+    WHERE (r.store_id,r.id)=(p.store_id,p.rental_id) AND (p.store_id,p.order_id)=($1,$2)`,[B,thirtyDays.id]);
+  await ok('POST',path+'rentals/'+rental.id+'/cancel',outsider,{refund:false});
+  const readClosedOrder=async()=> (await ok('GET',path+'monthly-sales/'+today.day,outsider)).find(row=>row.order_id===thirtyDays.id);
+  const closedOrder=await readClosedOrder();
+  assert.deepEqual([closedOrder.cost,closedOrder.profit],['3.50','175.50']);
+  await db.query('UPDATE rentals SET closed_at=NULL WHERE (store_id,id)=($1,$2)',[B,rental.id]);
+  assert.equal((await readClosedOrder()).cost,null);
+  await db.query('UPDATE rentals SET confirmed_usage_days=1 WHERE (store_id,id)=($1,$2)',[B,rental.id]);
+  assert.deepEqual([(await readClosedOrder()).cost,(await readClosedOrder()).profit],['3.50','175.50']);
+  assert.deepEqual((await ok('GET',path+'owner-overview',outsider)).monthly_cost,after);
+  const rebound=await ok('POST',path+'accounts',outsider,{platform:'netflix',email_id:idle.email_id,
+    otp:'123456',profile_count:1,broker_amount:'0',subscription_amount:'0'});
+  assert.notEqual(rebound.id,idle.id);
+});
+integration('manual credit is audited without payment and early cancellation credits six unused days after revocation',async()=>{
+  const path=storePath(B);
+  const customer=await ok('POST',path+'customers',outsider,{name:'Cancellation fixture'});
+  const adjustment=path+'customers/'+customer.id+'/credit-adjustments';
+  const deposit={direction:'ADD',amount:'80',reason:'Demo adjustment',confirm:true};
+  const key=uid();
+  const posted=await ok('POST',adjustment,outsider,deposit,200,key);
+  assert.deepEqual(await ok('POST',adjustment,outsider,deposit,200,key),posted);
+  await ok('POST',adjustment,outsider,{...deposit,amount:'81'},409,key);
+  await ok('POST',adjustment,outsider,{...deposit,direction:'REMOVE',amount:'81'},409);
+  await ok('POST',adjustment,outsider,{...deposit,direction:'REMOVE',amount:'10'});
+  const plan=await ok('POST',path+'packages',outsider,{platform:'netflix',name:'Cancellation seven days',days:7,amount:'70'});
+  const order=await ok('POST',path+'orders',outsider,{customer_id:customer.id,package_id:plan.id,days:7,amount:'70',confirm:true});
+  const account=(await ok('GET',path+'accounts',outsider)).find(row=>row.health==='HEALTHY');
+  const profile=(await ok('GET',path+'profiles',outsider))
+    .find(row=>row.account_id===account.id&&row.status==='AVAILABLE'&&!row.is_primary);
+  await ok('POST',path+'accounts/'+account.id+'/profiles/'+profile.id+'/pin',outsider,{pin:'0427'});
+  const delivery=await ok('POST',path+'allocate',outsider,{order_id:order.id,account_id:account.id,profile_id:profile.id});
+  const {digest,matches}=await import('../apps/api/db.mjs');
+  const {WorkerClient}=await import('../packages/shared/worker-client.mts');
+  const {MockStreamingProviderAdapter}=await import('../apps/mock-worker/worker.mjs');
+  const workerId='refund-'+uid(), workerToken=token();
+  await db.query("INSERT INTO workers VALUES($1,$2,now()+interval '1 day')",[workerId,digest(workerToken)]);
+  await db.query('INSERT INTO worker_stores VALUES($1,$2)',[workerId,B]);
+  const refundWorker=new WorkerClient(base,workerToken,workerId);
+  async function complete(type,id) {
+    const {job,lease_token,fencing_token}=await refundWorker.claim([type]);
+    assert.equal(job.id,id);
+    const lease={worker_id:workerId,lease_token,fencing_token};
+    await refundWorker.start(job.id,lease);
+    await refundWorker.report(job.id,{...lease,...new MockStreamingProviderAdapter().execute(job)});
+  }
+  await complete('DELIVER_ACCESS',delivery.job_id);
+  const rental=(await ok('GET',path+'rentals',outsider)).find(row=>row.order_id===order.id);
+  await db.query(`UPDATE rentals SET starts_at=starts_at-interval '36 hours',ends_at=ends_at-interval '36 hours'
+    WHERE (store_id,id)=($1,$2)`,[B,rental.id]);
+  await db.query(`UPDATE rental_service_periods SET starts_at=starts_at-interval '36 hours',ends_at=ends_at-interval '36 hours'
+    WHERE (store_id,order_id)=($1,$2)`,[B,order.id]);
+  const cancel=path+'rentals/'+rental.id+'/cancel';
+  const quote=await ok('GET',cancel+'-quote',outsider);
+  assert.deepEqual(quote,{used_days:1,remaining_days:6,credit_amount:'60.00'});
+  await ok('POST',cancel,outsider,{reason:'Demo cancellation',expected_credit:'50.00',confirm:true},409);
+  const revoke=await ok('POST',cancel,outsider,{reason:'Demo cancellation',expected_credit:quote.credit_amount,confirm:true});
+  const balance=async()=> (await ok('GET',path+'customers',outsider)).find(row=>row.id===customer.id).balance;
+  assert.equal(await balance(),'0.00');
+  const readProfile=async()=> (await db.query('SELECT status,pin_hash FROM profiles WHERE (store_id,id)=($1,$2)',[B,profile.id])).rows[0];
+  const prior=await readProfile();
+  assert.equal(prior.status,'OCCUPIED');
+  assert.equal(await matches('streaming-profile-pin:0427',prior.pin_hash),true);
+  await ok('POST',cancel,outsider,{reason:'Duplicate',expected_credit:quote.credit_amount,confirm:true},409);
+  await complete('REVOKE_ACCESS',revoke.job_id);
+  const released=await readProfile();
+  assert.equal(released.status,'AVAILABLE');
+  assert.ok(released.pin_hash);
+  assert.equal(await matches('streaming-profile-pin:0427',released.pin_hash),false);
+  assert.equal(await balance(),'60.00');
+  const {rows:ledger}=await db.query('SELECT amount,source FROM wallet_adjustments WHERE store_id=$1 AND customer_id=$2 ORDER BY amount',[B,customer.id]);
+  assert.deepEqual(ledger,[{amount:'-10.00',source:'MANUAL_NO_PAYMENT'},{amount:'60.00',source:'RENTAL_CANCEL_CREDIT'},{amount:'80.00',source:'MANUAL_NO_PAYMENT'}]);
+  assert.equal((await ok('GET',path+'owner-overview',outsider)).credits_in,'379.00');
+  const movableOrder=await ok('POST',path+'orders',outsider,{customer_id:customer.id,package_id:plan.id,days:7,amount:'70',confirm:true},409);
+  assert.equal(movableOrder.code,'INSUFFICIENT_CREDIT');
+  await ok('POST',adjustment,outsider,{...deposit,amount:'10'});
+  const next=await ok('POST',path+'orders',outsider,{customer_id:customer.id,package_id:plan.id,days:7,amount:'70',confirm:true});
+  const pinPath=path+'accounts/'+account.id+'/profiles/'+profile.id+'/pin';
+  await ok('POST',pinPath,outsider,{pin:'1234'});
+  assert.deepEqual(await ok('GET',pinPath,outsider),{pin:'1234',pin_set:true});
+  await ok('GET',pinPath,owner,undefined,403);
+  const nextDelivery=await ok('POST',path+'allocate',outsider,{order_id:next.id,account_id:account.id,profile_id:profile.id});
+  await complete('DELIVER_ACCESS',nextDelivery.job_id);
+  const getRental=async()=> (await ok('GET',path+'rentals',outsider)).find(row=>row.order_id===next.id);
+  const original=await getRental();
+  const rentalPath=path+'rentals/'+original.id;
+  const shortened=await ok('POST',rentalPath+'/remaining-days',outsider,{remaining_days:3,expected_ends_at:original.ends_at});
+  assert.equal(shortened.remaining_days,3);
+  await ok('POST',rentalPath+'/remaining-days',outsider,{remaining_days:5,expected_ends_at:original.ends_at},409);
+  const extended=await ok('POST',rentalPath+'/remaining-days',outsider,{remaining_days:5,expected_ends_at:shortened.ends_at});
+  const clear=await ok('POST',rentalPath+'/release-profile',outsider,{profile_id:profile.id});
+  assert.equal(clear.remaining_days,5);
+  assert.equal((await readProfile()).status,'AVAILABLE');
+  const unassigned=await getRental();
+  assert.deepEqual([unassigned.status,unassigned.profile_unassigned,unassigned.profile_label,unassigned.ends_at],['ACTIVE',true,null,extended.ends_at]);
+  assert.equal(await balance(),'0.00');
+  const newPin=(await ok('GET',pinPath,outsider)).pin;
+  assert.match(newPin,/^[0-9]{4}$/);
+  assert.notEqual(newPin,'1234');
+  assert.equal((await ok('GET',path+'accounts/'+account.id+'/profile-pins',outsider))[profile.id],newPin);
+  const [replacement]=await ok('GET',rentalPath+'/replacement',outsider);
+  const different=replacement.profiles.find(row=>row.id!==profile.id);
+  assert.ok(different);
+  const target={account_id:replacement.id,profile_id:different.id};
+  const assigned=await ok('POST',rentalPath+'/replacement',outsider,target);
+  assert.equal((await getRental()).assignment_pending,true);
+  await ok('POST',rentalPath+'/replacement',outsider,target,409);
+  await complete('DELIVER_ACCESS',assigned.job_id);
+  const result=await getRental();
+  assert.deepEqual([result.profile_id,result.profile_unassigned,result.ends_at],[target.profile_id,false,extended.ends_at]);
+  assert.equal(await balance(),'0.00');
+  const email=(await ok('GET',path+'streaming-emails',outsider)).find(row=>row.email===account.email);
+  const emailPath=path+'streaming-emails/'+email.id;
+  const emailDetails=await ok('GET',emailPath,outsider);
+  assert.equal(emailDetails.password,'Demo-Mail-Only!');
+  assert.deepEqual(emailDetails.accounts,[{id:account.id,platform:'netflix'}]);
+  await ok('GET',emailPath,owner,undefined,403);
+  assert.equal((await ok('POST',emailPath+'/archive',outsider,{})).accounts_removed,1);
+  await ok('GET',emailPath,outsider,undefined,404);
+  assert.ok((await ok('GET',path+'accounts',outsider)).every(row=>row.id!==account.id));
+  const afterRemoval=await getRental();
+  assert.deepEqual([afterRemoval.profile_unassigned,afterRemoval.ends_at],[true,extended.ends_at]);
+  const adjusted=await ok('POST',rentalPath+'/adjust-days',outsider,{
+    direction:'REMOVE',days:1,expected_ends_at:extended.ends_at
+  });
+  assert.equal(adjusted.remaining_days,4);
+  const quoted=await ok('GET',rentalPath+'/cancel-quote',outsider);
+  assert.deepEqual([quoted.remaining_days,quoted.credit_amount],[4,'40.00']);
+  await ok('POST',rentalPath+'/cancel',outsider,{refund:true,expected_credit:'70.00'},409);
+  await ok('POST',rentalPath+'/cancel',outsider,{refund:true,expected_credit:'40.00'});
+  assert.equal((await getRental()).status,'CLOSED');
+  assert.equal(await balance(),'40.00');
+  const other=(await ok('GET',path+'rentals',outsider)).find(row=>row.status==='ACTIVE'&&row.remaining_days>0);
+  assert.ok(other);
+  const otherPath=path+'rentals/'+other.id;
+  await ok('POST',otherPath+'/adjust-days',outsider,{
+    direction:'REMOVE',days:other.remaining_days,expected_ends_at:other.ends_at
+  });
+  assert.equal((await ok('GET',path+'rentals',outsider)).find(row=>row.id===other.id).status,'CLOSED');
+  const day=new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Bangkok'}).format(new Date());
+  const log=await ok('GET',path+'wallet-log/'+day,outsider);
+  const entries=log.entries.filter(row=>row.customer==='Cancellation fixture');
+  assert.equal(entries.filter(row=>row.kind==='RENTAL_CANCEL_CREDIT').length,2);
+  assert.ok(entries.some(row=>row.kind==='RENTAL_CANCEL_CREDIT'&&row.amount===40&&row.reference===original.id));
+  assert.ok(entries.some(row=>row.kind==='ORDER'&&row.amount===-70&&row.reference===next.id));
+  await ok('GET',path+'wallet-log/'+day,owner,undefined,403);
+});
+
+integration('Super Admin removal cascades store data and removes shared staff access',async()=>{
+  const current_password='Updated-Admin-Test-2026!';
+  const create=async role=>ok('POST','/v1/admin/users',admin,{role,username:'remove-'+uid(),password,current_password});
+  const target=await create('OWNER');
+  const staff=await create('OWNER');
+  const delegated=await create('ADMIN');
+  const login=async user=>(await ok('POST','/v1/login',null,{username:user.username,password})).token;
+  const [staffToken,delegatedToken,targetToken]=await Promise.all([login(staff),login(delegated),login(target)]);
+  const doomed=await ok('POST','/v1/admin/stores',admin,{name:'Deletion fixture',owner_id:target.id,current_password});
+  const doomedPath=storePath(doomed.id);
+  await db.query("INSERT INTO memberships VALUES($1,$3,'STAFF'),($2,$3,'HEAD_STAFF')",[doomed.id,B,staff.id]);
+  await ok('POST',doomedPath+'customers',targetToken,{name:'Deleted customer'});
+  const email=await ok('POST',doomedPath+'streaming-emails',targetToken,{email:uid()+'@example.invalid',password});
+  await ok('POST',doomedPath+'accounts',targetToken,{platform:'netflix',email_id:email.id,otp:'123456',broker_amount:'10',subscription_amount:'50'});
+  await ok('POST',doomedPath+'bot-jobs',targetToken,verify(),201);
+  const body={current_password,confirm:true};
+  await ok('POST','/v1/admin/owners/'+target.id+'/remove',delegatedToken,{...body,current_password:password},403);
+  await ok('POST','/v1/admin/owners/'+target.id+'/remove',admin,body);
+  for(const table of ['memberships','customers','accounts','profiles','jobs','job_events','streaming_account_cost_rates']){
+    assert.equal((await db.query('SELECT 1 FROM '+table+' WHERE store_id=$1',[doomed.id])).rowCount,0);
+  }
+  assert.equal((await db.query('SELECT 1 FROM stores WHERE id=$1',[doomed.id])).rowCount,0);
+  assert.equal((await db.query('SELECT 1 FROM stores WHERE id=$1',[B])).rowCount,1);
+  assert.equal((await db.query('SELECT 1 FROM memberships WHERE user_id=$1',[staff.id])).rowCount,0);
+  await ok('GET','/v1/me',targetToken,undefined,401);
+  await ok('GET','/v1/me',staffToken,undefined,401);
+  await ok('POST','/v1/admin/admins/'+delegated.id+'/remove',admin,body);
+  await ok('GET','/v1/me',delegatedToken,undefined,401);
+  assert.ok((await ok('GET','/v1/admin/admins',admin)).every(row=>row.id!==delegated.id));
 });
 
