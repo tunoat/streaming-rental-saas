@@ -138,7 +138,10 @@ test('provider retries bounded transient errors and maps invalid_grant',async()=
 });
 
 test('mock OAuth state is bound, one-time, denied safely and verified by its own worker',opts,async()=>{
-  const email=await emailFixture(),path=route(store,email);
+  const email=await emailFixture('mock-'+randomUUID()+'@example.invalid'),path=route(store,email);
+  const streamingRoot='/v1/stores/'+store+'/';
+  const binding={platform:'netflix',email_id:email,profile_count:5,broker_amount:'0',subscription_amount:'0'};
+  assert.equal((await call(mockBase,streamingRoot+'accounts',{token:owner,body:binding,status:400})).data.code,'STREAMING_EMAIL_NOT_READY');
   await call(mockBase,path+'/connection',{token:staff,status:403});
   await call(mockBase,path+'/connection',{token:outsider,status:403});
   await call(mockBase,route(otherStore,email)+'/connection',{token:outsider,status:404});
@@ -163,6 +166,10 @@ test('mock OAuth state is bound, one-time, denied safely and verified by its own
   assert.equal(final.evidence.provenance,'MOCK');
   assert.equal(final.evidence.empty_inbox,true);
   assert.equal(final.evidence.metadata_read,false);
+  const list=async()=> (await call(mockBase,streamingRoot+'streaming-emails',{token:owner})).data.find(row=>row.id===email);
+  assert.deepEqual([(await list()).password_set,(await list()).gmail_verified,(await list()).bound_platforms],[false,true,[]]);
+  await call(mockBase,streamingRoot+'accounts',{token:owner,body:binding});
+  assert.deepEqual((await list()).bound_platforms,['netflix']);
   assert.equal((await statusOf(liveBase,path)).status,'AUTH_REQUIRED');
   const verifyKey=randomUUID();
   const verify=await call(mockBase,path+'/connection/verify',{token:owner,body:{},key:verifyKey,status:202});
@@ -175,6 +182,7 @@ test('mock OAuth state is bound, one-time, denied safely and verified by its own
   await call(mockBase,path+'/connection/disconnect',{token:owner,body:{confirm:true}});
   await assert.rejects(worker.client.heartbeat(job.id,lease),/STALE_FENCING_TOKEN/);
   assert.equal((await statusOf(mockBase,path)).status,'DISCONNECTED');
+  assert.equal((await list()).gmail_verified,false);
 });
 
 test('fake live verification brokers lease-only tokens, refreshes once, and stores evidence without email content',opts,async()=>{

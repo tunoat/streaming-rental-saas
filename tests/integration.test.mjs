@@ -107,12 +107,11 @@ integration('owner can approve mock credit and allocate verified inventory to mo
   assert.deepEqual(await ok('GET',storePath(B)+'streaming-emails',outsider),[]);
   await ok('POST',storePath(B)+'accounts',outsider,binding,400);
   await ok('POST',route+'accounts',owner,{...binding,platform:'other'},400);
-  await ok('POST',route+'accounts',owner,{...binding,otp:undefined},400);
   await ok('POST',route+'accounts',owner,{...binding,otp:'000000'},400);
   await ok('POST',route+'accounts',owner,{...binding,profile_count:0},400);
   await ok('POST',route+'accounts',owner,{...binding,broker_amount:undefined},400);
   assert.deepEqual(await ok('GET',route+'accounts',owner),[]);
-  const account=await ok('POST',route+'accounts',owner,binding);
+  const account=await ok('POST',route+'accounts',owner,{...binding,otp:undefined});
   const listed=(await ok('GET',route+'streaming-emails',owner))[0];
   assert.deepEqual([listed.email,listed.bound_platforms,listed.password_set],[credential.email,['netflix'],true]);
   assert.ok(!Object.hasOwn(listed,'password_hash'));

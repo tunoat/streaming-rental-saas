@@ -39,6 +39,7 @@ const errors={
   get UNSUPPORTED_STREAMING_PLATFORM(){return t('ขณะนี้เลือกได้เฉพาะ Netflix');},
   get MOCK_BIND_INVALID(){return t('กรุณาตรวจ OTP จำลอง');},
   get STREAMING_EMAIL_PASSWORD_REQUIRED(){return t('กรุณาตั้งรหัสผ่านในหน้าอีเมลบัญชีสตรีมมิงก่อน Bind');},
+  get STREAMING_EMAIL_NOT_READY(){return t('เชื่อม Gmail ให้ตรวจผ่าน หรือตั้งรหัสผ่านอีเมลจำลองก่อนผูกบัญชี');},
   get INVALID_PROFILE_COUNT(){return t('กรุณาระบุจำนวนโปรไฟล์เป็นจำนวนเต็มตั้งแต่ 1 ถึง 100');},
   get INVALID_USERNAME(){return t('ชื่อผู้ใช้ต้องมี 3–64 ตัว ใช้อักษรอังกฤษ ตัวเลข จุด ขีดกลาง หรือขีดล่าง');},
   get UNAUTHORIZED(){return t('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง หรือเซสชันหมดอายุ');},
@@ -853,6 +854,10 @@ async function render() {
         gmailConnectionPanel(view,selected.id,current);
         element('p',t('รหัสผ่านอีเมล')+' · '+(details.password??t(details.password_set?'ต้องตั้งรหัสผ่านอีเมลใหม่เพื่อให้ดูได้':'ยังไม่ได้ตั้งรหัสผ่านอีเมล')));
         element('h2',t('บัญชีที่ผูกแล้ว'));
+        if(selected.gmail_verified&&!selected.bound_platforms.includes('netflix')){
+          const next=element('button',t('เพิ่มบัญชีสตรีมมิงด้วยอีเมลนี้'));
+          next.onclick=()=>{selectedAccount=undefined;page='inventory';render();};
+        }
         for(const account of details.accounts){
           const button=element('button',platformName(account.platform));
           button.onclick=()=>{selectedAccount=account.id;page='inventory';render();};
@@ -874,7 +879,8 @@ async function render() {
       ],data=>shop('streaming-emails',data),view,t('เพิ่มอีเมล'));
       for(const row of emails){
         const bound=row.bound_platforms.length>0;
-        const open=element('button',row.email+' · '+(bound?t('ผูกบัญชีแล้ว'):t('ยังไม่ได้ผูกบัญชี')));
+        const label=bound?t('ผูกบัญชีแล้ว'):row.gmail_verified?t('พร้อมผูกบัญชีสตรีมมิง'):t('ยังไม่ได้ผูกบัญชี');
+        const open=element('button',row.email+' · '+label);
         open.className='inventory-account';
         open.onclick=()=>{selectedStreamingEmail=row.id;render();};
       }
@@ -983,15 +989,14 @@ async function render() {
         }
         const bind=form(t('เพิ่มบัญชีสตรีมมิงจำลอง'),[
           ['platform',t('แพลตฟอร์ม'),'',streamingPlatforms],['email_id',t('อีเมลบัญชีสตรีมมิง'),'',[]],
-          ['otp',t('OTP จำลอง'),{type:'text',inputMode:'numeric',maxLength:6,pattern:'[0-9]{6}',autocomplete:'off'}],
           ['profile_count',t('จำนวนโปรไฟล์'),{type:'number',min:1,max:100,step:1,value:5}],
           ...accountCostFields()
         ],data=>shop('accounts',{...data,profile_count:Number(data.profile_count)}),bindPanel,t('Bind บัญชี'));
-        element('p',t('เลือกอีเมลที่ตั้งรหัสผ่านไว้ ใช้ OTP จำลอง 123456'),bindPanel).className='inventory-hint';
         const showEmails=()=>{
-          const available=emails.filter(row=>row.password_set&&!row.bound_platforms.includes(bind.elements.platform.value));
+          const available=emails.filter(row=>(row.gmail_verified||row.password_set)&&!row.bound_platforms.includes(bind.elements.platform.value));
           bind.elements.email_id.replaceChildren(new Option(available.length?t('เลือกอีเมล'):t('ไม่มีอีเมลพร้อมผูกบัญชี'),''),
             ...available.map(row=>new Option(row.email,row.id)));
+          if(available.some(row=>row.id===selectedStreamingEmail)) bind.elements.email_id.value=selectedStreamingEmail;
           bind.elements.email_id.disabled=!available.length;
           bind.querySelector('button').disabled=!available.length;
         };

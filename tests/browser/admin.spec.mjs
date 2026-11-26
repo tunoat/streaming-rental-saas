@@ -100,7 +100,8 @@ test('one-time bootstrap and Thai mock rental walkthrough on mobile',async({page
     await expect(page.getByLabel('จำนวนโปรไฟล์',{exact:true})).toHaveValue('5');
     await page.locator('select[name=email_id]').selectOption({label:streamingEmail});
     await expect(form(0).locator('input[type=password]')).toHaveCount(0);
-    await fill({'จำนวนโปรไฟล์':'3','OTP จำลอง':'123456','ค่าบริการสตรีมมิงต่อเดือน (บาท)':'400'});
+    await expect(form(0).locator('[name=otp]')).toHaveCount(0);
+    await fill({'จำนวนโปรไฟล์':'3','ค่าบริการสตรีมมิงต่อเดือน (บาท)':'400'});
     await button('Bind บัญชี',form(0)).click();
     await page.locator('button.inventory-account').filter({hasText:streamingEmail}).click();
     await expect(page.getByText('profile3',{exact:true})).toBeVisible();

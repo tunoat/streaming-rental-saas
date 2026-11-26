@@ -177,11 +177,16 @@ const eligibleOrder=`o.store_id=a.store_id AND o.status='PAID_WAITING' AND a.hea
   AND a.archived_at IS NULL
   AND (o.platform IS NULL OR a.platform=o.platform)
   AND a.checked_at>now()-interval '24 hours' AND a.subscription_until>=now()+(o.days*interval '24 hours')`;
+const verifiedGmail=`EXISTS (SELECT 1 FROM gmail_connections g
+  WHERE (g.store_id,g.email_id,g.email)=(e.store_id,e.id,e.email)
+  AND g.status='CONNECTED' AND g.evidence->>'provenance'=upper(g.mode)
+  AND g.evidence->>'identity_match'='true')`;
 const entities = {
   customers:'SELECT c.id,c.name,c.alias,c.url,COALESCE(sum(l.amount),0)::numeric(18,2) AS balance FROM customers c LEFT JOIN wallet_entries l ON c.store_id=l.store_id AND c.id=l.customer_id WHERE c.store_id=$1 GROUP BY c.store_id,c.id ORDER BY c.name,c.id',
   'customer-directory':'SELECT id,name,alias,url FROM customers WHERE store_id=$1 ORDER BY name,id',
   accounts:'SELECT id,platform,email,health,subscription_until FROM accounts WHERE store_id=$1 AND archived_at IS NULL ORDER BY platform,email',
-  'streaming-emails':`SELECT e.id,e.email,e.password_hash IS NOT NULL AS password_set,coalesce(array_agg(a.platform ORDER BY a.platform)
+  'streaming-emails':`SELECT e.id,e.email,e.password_hash IS NOT NULL AS password_set,${verifiedGmail} AS gmail_verified,
+    coalesce(array_agg(a.platform ORDER BY a.platform)
     FILTER (WHERE a.id IS NOT NULL),ARRAY[]::text[]) AS bound_platforms
     FROM streaming_email_addresses e LEFT JOIN accounts a ON (a.store_id,a.email)=(e.store_id,e.email) AND a.archived_at IS NULL
     WHERE e.store_id=$1 AND e.archived_at IS NULL GROUP BY e.store_id,e.id ORDER BY e.email`,
@@ -596,15 +601,15 @@ export function registerWorkflow(secured) {
     return {accounts_removed:ids.length};
   },{owner:true});
   register('POST','accounts',async(q,s,b,req,auth)=>{
-    if (b.otp!=='123456') reject(400,'MOCK_BIND_INVALID');
+    if (b.otp!==undefined&&b.otp!=='123456') reject(400,'MOCK_BIND_INVALID');
     const platform=streamingPlatform(b.platform);
     const profileCount=b.profile_count===undefined?5:b.profile_count;
     if (!Number.isInteger(profileCount) || profileCount<1 || profileCount>100)
       reject(400,'INVALID_PROFILE_COUNT');
     const costs=accountCostParts(b);
-    const {rows:[credential]}=await q(`SELECT email,password_hash IS NOT NULL AS password_set FROM streaming_email_addresses
-      WHERE store_id=$1 AND id=$2 AND archived_at IS NULL`,[s,validId(b.email_id)]);
-    if (!credential?.password_set) reject(400,'STREAMING_EMAIL_PASSWORD_REQUIRED');
+    const {rows:[credential]}=await q(`SELECT e.email,(e.password_hash IS NOT NULL OR ${verifiedGmail}) AS ready
+      FROM streaming_email_addresses e WHERE (e.store_id,e.id)=($1,$2) AND e.archived_at IS NULL`,[s,validId(b.email_id)]);
+    if (!credential?.ready) reject(400,'STREAMING_EMAIL_NOT_READY');
     const {email}=credential;
     const {rows:[{count}]}=await q('SELECT count(DISTINCT email)::int AS count FROM accounts WHERE store_id=$1 AND email<>$2 AND archived_at IS NULL',[s,email]);
     if (count>=({STARTER:20,PRO:100,BUSINESS:200})[req.plan]) reject(409,'EMAIL_QUOTA');
