@@ -144,5 +144,6 @@ main details[open] > summary {background:#e6f3ec;color:#164f43}
 .customer-card a {width:fit-content}
 main details > .inventory-profile-summary {width:100%;margin:0}
 .customer-card a {display:inline-flex;align-items:center;text-decoration:none}
+.gmail-consent-link {display:inline-block;margin-inline:.6rem;padding:.5rem .8rem;color:#164f43;border:1px solid #418675;border-radius:.45rem}
 @media(max-width:760px) { .inventory-columns,.inventory-profile-actions {grid-template-columns:1fr} }
 

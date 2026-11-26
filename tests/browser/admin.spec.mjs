@@ -172,8 +172,9 @@ test('one-time bootstrap and Thai mock rental walkthrough on mobile',async({page
     }});
     await button('อีเมลบัญชีสตรีมมิง').click();
     await page.getByRole('button',{name:new RegExp(streamingEmail)}).click();
-    const popupPromise=page.waitForEvent('popup');
     await button('เชื่อม Gmail').click();
+    const popupPromise=page.waitForEvent('popup');
+    await page.getByRole('link',{name:'เปิดหน้าอนุญาต Gmail'}).click();
     const popup=await popupPromise;
     await popup.getByRole('button',{name:'Allow'}).click();
     await expect(popup.getByRole('heading',{name:'Gmail verification queued'})).toBeVisible();

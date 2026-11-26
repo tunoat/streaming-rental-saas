@@ -10,6 +10,8 @@ const customerDirectory={page:0,query:''};
 const inventoryDirectories=new Map();
 let selectedStreamingEmail;
 const errors={
+  get GMAIL_CALLBACK_ORIGIN_MISMATCH(){return t('เปิดแอปที่ 127.0.0.1:3000 เพื่อเชื่อม Gmail จริง');},
+  get OAUTH_RATE_LIMIT(){return t('สร้างลิงก์หลายครั้งเกินไป กรุณารอสักครู่แล้วลองใหม่');},
   get PRIMARY_PROFILE_RESERVED(){return t('โปรไฟล์หลักไม่สามารถนำไปให้เช่าหรือลบได้');},
   get CANCELLATION_UNAVAILABLE(){return t('รายการเช่านี้ไม่สามารถยกเลิกได้');},
   get CANCELLATION_QUOTE_CHANGED(){return t('ยอดเครดิตคืนเปลี่ยนแล้ว กรุณาดูยอดล่าสุดอีกครั้ง');},
@@ -116,9 +118,10 @@ function gmailConnectionPanel(parent,emailId,current){
   const labels={NOT_CONNECTED:t('ยังไม่ได้เชื่อม Gmail'),AUTHORIZING:t('รออนุญาต Gmail'),VERIFYING:t('กำลังตรวจกล่องจดหมาย'),
     CONNECTED:t('เชื่อม Gmail แล้ว'),AUTH_REQUIRED:t('ต้องอนุญาต Gmail ใหม่'),FAILED:t('ตรวจ Gmail ไม่สำเร็จ'),DISCONNECTED:t('ยกเลิกการเชื่อม Gmail แล้ว')};
   const errors={AUTH_REQUIRED:labels.AUTH_REQUIRED,IDENTITY_MISMATCH:t('บัญชี Google ไม่ตรงกับอีเมลที่เลือก'),
-    IDENTITY_INVALID:t('ยืนยันตัวตน Google ไม่สำเร็จ'),SCOPE_INVALID:t('สิทธิ์อ่าน Gmail ไม่ครบ'),MODE_MISMATCH:t('โหมด Gmail เปลี่ยน กรุณาเชื่อมใหม่'),
+    IDENTITY_INVALID:t('ยืนยันตัวตน Google ไม่สำเร็จ'),SCOPE_INVALID:t('สิทธิ์อ่าน Gmail ไม่ครบ'),
+    SCOPE_EXCESS:t('Google คืนสิทธิ์มากกว่าที่แอปร้องขอ'),MODE_MISMATCH:t('โหมด Gmail เปลี่ยน กรุณาเชื่อมใหม่'),
     PROVIDER_UNAVAILABLE:t('บริการ Gmail ไม่พร้อม กรุณาลองใหม่'),LEASE_EXPIRED:t('งานตรวจ Gmail หมดเวลา')};
-  let timer;
+  let timer,authorizationUrl,authorizationError,opening=false;
   function schedule(attempt){
     clearTimeout(timer);
     if(attempt<16) timer=setTimeout(()=>load(attempt+1),Math.min(1000*2**attempt,5000));
@@ -133,23 +136,33 @@ function gmailConnectionPanel(parent,emailId,current){
       element('p',(state.mode==='mock'?t('โหมด Gmail จำลอง'):t('โหมด Gmail จริงสำหรับทดสอบ'))+' · '+labels[state.status],content);
       if(state.last_verified_at) element('p',t('ตรวจล่าสุด ')+storeDate.format(new Date(state.last_verified_at)),content);
       if(state.error) element('p',errors[state.error]??labels.FAILED,content);
+      if(authorizationError){
+        const feedback=element('p',authorizationError,content);
+        feedback.setAttribute('role','alert');
+      }
       if(state.status==='CONNECTED'&&state.evidence) element('p',t(state.evidence.empty_inbox?
         'อ่านรายการกล่องจดหมายได้ กล่องจดหมายว่าง':'ตรวจข้อมูลกำกับอีเมลหนึ่งฉบับแล้ว'),content);
       const pending=['AUTHORIZING','VERIFYING'].includes(state.status);
       if(pending) schedule(attempt);
+      if(state.status!=='AUTHORIZING') authorizationUrl=undefined;
       const connect=element('button',['NOT_CONNECTED','DISCONNECTED'].includes(state.status)?t('เชื่อม Gmail'):t('เชื่อม Gmail ใหม่'),content);
-      connect.disabled=pending;
+      connect.disabled=opening||state.status==='VERIFYING';
       connect.onclick=async()=>{
-        const popup=window.open('about:blank','_blank','popup,width=580,height=690');
-        if(!popup){notice(t('อนุญาตให้เปิดหน้าต่างเพื่อเชื่อม Gmail'));return;}
-        popup.opener=null;
+        if(opening) return;
+        opening=true;
+        authorizationError=undefined;
         connect.disabled=true;
         try{
           const result=await shop(path+'connections/gmail/authorize',{});
-          popup.location.replace(result.authorization_url);
-          await load();
-        }catch(error){popup.close();notice(error.message);connect.disabled=false;}
+          authorizationUrl=result.authorization_url;
+        }catch(error){authorizationError=error.message;}
+        finally{opening=false;await load();}
       };
+      if(authorizationUrl){
+        const link=element('a',t('เปิดหน้าอนุญาต Gmail'),content);
+        Object.assign(link,{href:authorizationUrl,target:'_blank',rel:'noopener noreferrer'});
+        link.className='gmail-consent-link';
+      }
       if(['CONNECTED','FAILED'].includes(state.status)){
         const verify=element('button',t('ตรวจกล่องจดหมาย Gmail'),content);
         verify.onclick=async()=>{

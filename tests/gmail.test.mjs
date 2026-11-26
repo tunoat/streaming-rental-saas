@@ -121,6 +121,7 @@ test('real exchange validates signed OIDC identity, nonce, email, profile and re
   for(const claims of [{nonce:'wrong'},{email_verified:false},{aud:'wrong'},{exp:1},{iss:'other'}])
     await assert.rejects(exchangeGoogle(live,'synthetic',proof,contact,send(claims)),/IDENTITY_INVALID/);
   await assert.rejects(exchangeGoogle(live,'synthetic',proof,contact,send({},'openid')),/SCOPE_INVALID/);
+  await assert.rejects(exchangeGoogle(live,'synthetic',proof,contact,send({},readScope+' https://www.googleapis.com/auth/gmail.modify')),/SCOPE_EXCESS/);
   await assert.rejects(exchangeGoogle(live,'synthetic',proof,contact,send({},readScope,'other@example.invalid')),/IDENTITY_MISMATCH/);
 });
 

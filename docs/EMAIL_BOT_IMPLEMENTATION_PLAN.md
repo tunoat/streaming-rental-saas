@@ -14,7 +14,7 @@ The starting main commit was `85bce4dea39913c73777287f1dc703c769542d70`. The che
 - The first module uses explicit verification only. It has no scheduled health checks and does not read message bodies. Empty inbox evidence is valid, as is metadata access for one message. Even metadata responses request only the ID.
 - Google token endpoints and JWKS are fixed. Live runs require a loopback bind and redirect, explicit development/test mode and an encryption key. Provider-issued access token lifetime is reported as issued by Google. A lease controls when the broker can release the token, not Google's remaining token lifetime after issuance.
 - Owner consent uses a separate tab, five-minute PKCE state, a state-specific HttpOnly cookie and the current Owner session. Live callback validates exact origin at authorization and returns only a fixed local result status.
-- Worker capability registration belongs to mock or live mode. A mock result cannot advance a live connection. No actual Google smoke test has been performed.
+- Worker capability registration belongs to mock or live mode. A mock result cannot advance a live connection. Live Google smoke verification passed for Inbox listing and one metadata read after tester consent.
 - Remote revocation is best effort after committing local disconnect. The server skips remote revoke when another local credential uses the same Google subject. The service has no visibility into grants held by other applications.
 
 ## Rollback
@@ -31,7 +31,8 @@ Keep the additive schema while rolling back application code and stopping the Gm
 | OpenAPI and generation | PASS, generated Gmail types and validated all three contracts. Redocly emitted 15 warnings, including the Gmail callback's intentionally redirect-only response. |
 | PostgreSQL, provider doubles and security regression tests | PASS, 31 checks |
 | Edge mobile walkthrough with isolated PostgreSQL | PASS, 1 walkthrough including mock consent, worker evidence and disconnect. Fixed stale legacy selectors encountered on earlier attempts. |
-| Actual Google smoke, marked test-message body access and independent penetration testing | NOT RUN |
+| Actual Google smoke | PASS, backend accepted LIVE profile match, Inbox listing and metadata read on 2026-11-26 |
+| Marked test-message body access and independent penetration testing | NOT RUN |
 
 No dependency addition was needed. The existing running web and streaming worker processes were not restarted for this feature. No push or deployment was performed.
 

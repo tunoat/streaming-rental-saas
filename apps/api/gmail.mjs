@@ -10,7 +10,7 @@ import {exchangeGoogle,gmailConfig,googleAuthorization,readScope,refreshGoogle,r
 const ownerPath='/v1/stores/:storeId/email-addresses/:emailId';
 const workerPath='/v1/email-worker/stores/:storeId/jobs';
 const liveJobStatuses=['QUEUED','LEASED','RUNNING'];
-const safeErrors=['AUTH_REQUIRED','IDENTITY_MISMATCH','IDENTITY_INVALID','SCOPE_INVALID','PROVIDER_UNAVAILABLE',
+const safeErrors=['AUTH_REQUIRED','IDENTITY_MISMATCH','IDENTITY_INVALID','SCOPE_INVALID','SCOPE_EXCESS','PROVIDER_UNAVAILABLE',
   'PROVIDER_REJECTED','TOKEN_REJECTED','EVIDENCE_INVALID','LEASE_EXPIRED'];
 const opaque=/^[a-zA-Z0-9_-]{43}$/;
 const cookieName=state=>'gmail_'+digest(state).slice(0,24);
@@ -127,7 +127,9 @@ export function registerGmail(app,secured,config=gmailConfig(),provider={}){
   const returnPath='/gmail-consent-result?status=';
   app.get('/gmail-consent-result',(req,reply)=>{
     const status=req.query.status;
-    const message=status==='accepted'?'Gmail verification queued':status==='denied'?'Gmail consent declined':'Gmail authorization failed';
+    const message=status==='accepted'?'Gmail verification queued':status==='denied'?'Gmail consent declined':
+      status==='gmail_scope_missing'?'Google did not grant Gmail read access':
+      status==='gmail_scope_excess'?'Google returned permissions beyond the requested access':'Gmail authorization failed';
     return reply.type('text/html; charset=utf-8').send(`<!doctype html><html lang="en"><meta charset="utf-8">
       <title>Gmail</title><h1>${message}</h1><p>Close this tab and return to the store dashboard.</p></html>`);
   });
@@ -203,7 +205,9 @@ export function registerGmail(app,secured,config=gmailConfig(),provider={}){
           VALUES($1,$2,$3,'AUTH_REQUIRED',$4) ON CONFLICT(store_id,email_id) DO UPDATE
           SET status='AUTH_REQUIRED',error=excluded.error`,[store,email,config.mode,reason]);
       }).catch(()=>{});
-      return reply.redirect(returnPath+'failed',303);
+      const status=error.providerCode==='SCOPE_INVALID'?'gmail_scope_missing':
+        error.providerCode==='SCOPE_EXCESS'?'gmail_scope_excess':'failed';
+      return reply.redirect(returnPath+status,303);
     }
   });
 

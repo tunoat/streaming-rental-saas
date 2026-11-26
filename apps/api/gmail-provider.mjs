@@ -117,9 +117,10 @@ export async function googleIdentity(token,config,nonce,send){
 export async function exchangeGoogle(config,code,{verifier,nonce},expected,send){
   const token=await googleToken(config,{code,grant_type:'authorization_code',code_verifier:verifier,
     redirect_uri:config.redirect.href},send);
-  const scopes=String(token.scope??'').split(' ').filter(Boolean);
+  const scopes=String(token.scope??'').trim().split(/\s+/).filter(Boolean);
   const allowed=new Set(['openid','email','https://www.googleapis.com/auth/userinfo.email',readScope]);
-  if(!scopes.includes(readScope)||scopes.some(scope=>!allowed.has(scope))) throw failure('SCOPE_INVALID');
+  if(!scopes.includes(readScope)) throw failure('SCOPE_INVALID');
+  if(scopes.some(scope=>!allowed.has(scope))) throw failure('SCOPE_EXCESS');
   const identity=await googleIdentity(token.id_token,config,nonce,send);
   if(identity.email.toLowerCase()!==expected) throw failure('IDENTITY_MISMATCH');
   const profile=await googleJson(gmailBase+'/profile?fields=emailAddress',{headers:{authorization:'Bearer '+token.access_token}},send);
