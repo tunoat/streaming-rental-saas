@@ -94,6 +94,7 @@ test('one-time bootstrap and Thai mock rental walkthrough on mobile',async({page
     await button('เพิ่มอีเมล').click();
     await expect(page.getByText(streamingEmail+' · ยังไม่ได้ผูกบัญชี')).toBeVisible();
     await button('บัญชีสตรีมมิง').click();
+    await page.locator('summary').filter({hasText:'เพิ่มบัญชีสตรีมมิงจำลอง'}).click();
     const platform=page.getByRole('combobox',{name:'แพลตฟอร์ม',exact:true});
     await expect(platform.getByRole('option')).toHaveText(['Netflix']);
     await expect(platform).toHaveValue('netflix');
@@ -102,7 +103,7 @@ test('one-time bootstrap and Thai mock rental walkthrough on mobile',async({page
     await expect(form(0).locator('input[type=password]')).toHaveCount(0);
     await expect(form(0).locator('[name=otp]')).toHaveCount(0);
     await fill({'จำนวนโปรไฟล์':'3','ค่าบริการสตรีมมิงต่อเดือน (บาท)':'400'});
-    await button('Bind บัญชี',form(0)).click();
+    await button('สร้างบัญชีจำลอง',form(0)).click();
     await page.locator('button.inventory-account').filter({hasText:streamingEmail}).click();
     await expect(page.getByText('profile3',{exact:true})).toBeVisible();
     const costForm=page.locator('#view form').filter({has:button('บันทึกต้นทุน')});
@@ -183,9 +184,23 @@ test('one-time bootstrap and Thai mock rental walkthrough on mobile',async({page
     const gmailClient=new GmailWorkerClient(base,gmailToken,gmailWorkerId,store.id);
     expect((await runGmailOnce(gmailClient))?.status).toBe('CONNECTED');
     await expect(page.getByText('โหมด Gmail จำลอง · เชื่อม Gmail แล้ว')).toBeVisible({timeout:12000});
+    await expect(button('Bind บัญชี')).toHaveCount(0);
     page.once('dialog',dialog=>dialog.accept());
     await button('ยกเลิกการเชื่อม Gmail').click();
     await expect(page.getByText('โหมด Gmail จำลอง · ยกเลิกการเชื่อม Gmail แล้ว')).toBeVisible();
+    await button('บัญชีสตรีมมิง').click();
+    await page.locator('select[name=bind_email_id]').selectOption({label:streamingEmail});
+    await page.route('**/netflix-assist/chrome',route=>route.fulfill({json:{opened:true}}));
+    await page.route('**/netflix-assist/watch/start',route=>route.fulfill({json:{status:'FOUND'}}));
+    const launchRequest=page.waitForRequest(request=>request.url().endsWith('/netflix-assist/chrome'));
+    const gmailRequest=page.waitForRequest(request=>request.url().endsWith('/netflix-assist/chrome')&&request.postDataJSON().destination==='gmail');
+    await button('Bind บัญชี').click();
+    expect((await launchRequest).postDataJSON()).toEqual({destination:'netflix'});
+    await gmailRequest;
+    await expect(page.getByText('พบอีเมลใหม่ที่เข้าข่ายจาก Netflix เปิด Gmail เพื่อตรวจเอง')).toBeVisible();
+    await expect(button('ถัดไป: บันทึกผลเข้าโปรไฟล์')).toHaveCount(0);
+    await button('เข้าโปรไฟล์หลักได้').click();
+    await expect(page.getByText('พร้อมใช้งาน (Owner ยืนยัน)',{exact:false})).toBeVisible();
     await page.screenshot({path:info.outputPath('thai-owner-mobile.png'),fullPage:true});
   } finally { await app.close(); await pool.end(); await db.end(); }
 });

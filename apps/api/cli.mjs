@@ -14,12 +14,13 @@ try {
     const password = await passwordHash(process.env.BOOTSTRAP_PASSWORD);
     const {rows:[user]} = await client.query('INSERT INTO users(username,password_hash,is_super) VALUES($1,$2,true) RETURNING id',[login,password]);
     await client.query("INSERT INTO admin_audit(actor_id,action,subject_id) VALUES($1,'ADMIN_BOOTSTRAPPED',$1)",[user.id]);
-  } else if (['worker','gmail-worker'].includes(command) && /^[a-zA-Z0-9_-]{1,128}$/.test(workerId ?? '') && stores.length) {
+  } else if (['worker','gmail-worker','netflix-worker'].includes(command) && /^[a-zA-Z0-9_-]{1,128}$/.test(workerId ?? '') && stores.length) {
     const token = process.env.BOT_WORKER_TOKEN;
     if (!/^[A-Za-z0-9_-]{43}$/.test(token ?? '')) throw new Error('Inject a random 32-byte base64url BOT_WORKER_TOKEN');
     await client.query("INSERT INTO workers VALUES($1,$2,now()+interval '24 hours')",[workerId,digest(token)]);
     for (const store of stores) await client.query('INSERT INTO worker_stores VALUES($1,$2)',[workerId,store]);
     if(command==='gmail-worker') await client.query('INSERT INTO gmail_workers VALUES($1,$2)',[workerId,process.env.GMAIL_ADAPTER??'mock']);
+    if(command==='netflix-worker') await client.query('INSERT INTO netflix_workers VALUES($1)',[workerId]);
   } else if (command === 'generate-worker-secret') {
     process.stdout.write(secret());
   } else {

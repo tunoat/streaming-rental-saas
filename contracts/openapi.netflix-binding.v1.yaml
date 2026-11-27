@@ -1,0 +1,114 @@
+openapi: 3.1.0
+info:
+  title: Netflix mock binding
+  version: 1.0.0
+  description: Local simulation of binding and assisted verification.
+security:
+  - bearer: []
+paths:
+  /v1/stores/{storeId}/email-addresses/{emailId}/streaming-binding:
+    parameters: &registry
+      - $ref: '#/components/parameters/Store'
+      - $ref: '#/components/parameters/Email'
+    get:
+      operationId: getNetflixBinding
+      summary: Read Owner binding state
+      responses:
+        '200':
+          description: Current binding and Gmail readiness
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Binding'}
+  /v1/stores/{storeId}/email-addresses/{emailId}/streaming-binding/{action}:
+    parameters: *registry
+    post:
+      operationId: updateNetflixBinding
+      summary: Start or update a mock binding
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+        - name: action
+          in: path
+          required: true
+          schema: {enum: [bind, verify, rebind, manual, cancel, reconcile, disconnect]}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                challenge: {enum: [AUTO, MANUAL]}
+                confirm: {const: true}
+                generation: {type: integer, minimum: 1}
+                code: {type: string, pattern: '^[0-9]{6}$'}
+      responses:
+        '202': {description: Work queued}
+        '200': {description: State updated}
+        '409': {description: Gmail unavailable or invalid state transition}
+  /v1/netflix-worker/stores/{storeId}/claim:
+    post:
+      operationId: claimNetflixMockBinding
+      summary: Lease one mock binding
+      parameters:
+        - $ref: '#/components/parameters/Store'
+        - $ref: '#/components/parameters/Idempotency'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_id]
+              properties:
+                worker_id: {type: string}
+      responses:
+        '200': {description: Binding with lease proof}
+        '204': {description: No work or capacity}
+  /v1/netflix-worker/stores/{storeId}/{emailId}/{operation}:
+    parameters: *registry
+    post:
+      operationId: updateNetflixMockLease
+      summary: Heartbeat or submit mock evidence
+      parameters:
+        - $ref: '#/components/parameters/Idempotency'
+        - name: operation
+          in: path
+          required: true
+          schema: {enum: [heartbeat, report]}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [worker_id, generation, fence, lease_token]
+              properties:
+                worker_id: {type: string}
+                generation: {type: integer, minimum: 1}
+                fence: {type: integer, minimum: 1}
+                lease_token: {type: string}
+                provenance: {const: MOCK}
+                outcome: {enum: [OTP_REQUESTED, WAITING_FOR_EMAIL, EMAIL_RECEIVED, VERIFIED, WAITING_FOR_USER, FAILED]}
+      responses:
+        '200': {description: Transition accepted}
+        '409': {description: Stale fence or invalid transition}
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer}
+  parameters:
+    Store: {name: storeId, in: path, required: true, schema: {type: string, format: uuid}}
+    Email: {name: emailId, in: path, required: true, schema: {type: string, format: uuid}}
+    Idempotency: {name: Idempotency-Key, in: header, required: true, schema: {type: string}}
+  schemas:
+    Binding:
+      type: object
+      required: [provider, mode, generation, status, verification_state, gmail_ready, last_verified_at, last_error]
+      properties:
+        provider: {const: netflix}
+        mode: {const: mock}
+        generation: {type: integer, minimum: 0}
+        status: {enum: [UNBOUND, QUEUED, BINDING, WAITING_FOR_USER, VERIFYING, BOUND, FAILED, AUTH_EXPIRED, CANCELLED, RECONCILING]}
+        verification_state: {type: [string, 'null']}
+        gmail_ready: {type: boolean}
+        last_verified_at: {type: [string, 'null'], format: date-time}
+        last_error: {type: [string, 'null']}

@@ -176,7 +176,7 @@ export function registerJobs(secured) {
           return [200,publicJob(changed)];
         });
       }
-      if ((await q('SELECT 1 FROM gmail_workers WHERE worker_id=$1',[auth.id])).rowCount) reject(403,'FORBIDDEN');
+      if ((await q('SELECT 1 FROM gmail_workers WHERE worker_id=$1 UNION ALL SELECT 1 FROM netflix_workers WHERE worker_id=$1',[auth.id])).rowCount) reject(403,'FORBIDDEN');
       const {rows:stores}=await q('SELECT store_id FROM worker_stores WHERE worker_id=$1 ORDER BY store_id',[auth.id]);
       if (req.body && req.body.worker_id!==auth.id) reject(403,'FORBIDDEN');
       if (operation==='claim') {
@@ -193,7 +193,8 @@ export function registerJobs(secured) {
             const {rows:[job]}=await q(`SELECT * FROM jobs WHERE store_id=$1 AND status IN ('QUEUED','RETRY_WAIT')
               AND type=ANY($2::text[]) AND ready_at<=now()
               AND (SELECT count(*) FROM jobs WHERE store_id=$1 AND status IN ('LEASED','RUNNING'))+
-                  (SELECT count(*) FROM gmail_jobs WHERE store_id=$1 AND status IN ('LEASED','RUNNING') AND lease_until>clock_timestamp())<4
+                  (SELECT count(*) FROM gmail_jobs WHERE store_id=$1 AND status IN ('LEASED','RUNNING') AND lease_until>clock_timestamp())+
+                  (SELECT count(*) FROM netflix_bindings WHERE store_id=$1 AND lease_until>clock_timestamp())<4
               ORDER BY CASE WHEN created_at<now()-interval '30 minutes' THEN least(priority,2) ELSE priority END,
               created_at,id LIMIT 1 FOR UPDATE`,[store,req.body.capabilities]);
             if (!job) continue;

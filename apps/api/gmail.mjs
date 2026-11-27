@@ -277,7 +277,8 @@ export function registerGmail(app,secured,config=gmailConfig(),provider={}){
         SELECT j.id FROM gmail_jobs j JOIN gmail_connections c ON (c.store_id,c.email_id,c.generation)=(j.store_id,j.email_id,j.generation)
         WHERE j.store_id=$1 AND j.mode=$2 AND j.status='QUEUED'
           AND (SELECT count(*) FROM jobs WHERE store_id=$1 AND status IN ('LEASED','RUNNING') AND lease_until>clock_timestamp())+
-              (SELECT count(*) FROM gmail_jobs WHERE store_id=$1 AND status IN ('LEASED','RUNNING'))<4
+              (SELECT count(*) FROM gmail_jobs WHERE store_id=$1 AND status IN ('LEASED','RUNNING'))+
+              (SELECT count(*) FROM netflix_bindings WHERE store_id=$1 AND lease_until>clock_timestamp())<4
         ORDER BY j.created_at,j.id LIMIT 1
       ) UPDATE gmail_jobs j SET status='LEASED',worker_id=$3,fence=j.fence+1,attempts=j.attempts+1,token_count=0,
         lease_until=clock_timestamp()+interval '90 seconds',started_at=NULL

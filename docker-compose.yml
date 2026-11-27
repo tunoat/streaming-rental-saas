@@ -53,6 +53,17 @@ services:
     command: ["npm", "run", "gmail-worker"]
     depends_on:
       - api
+  netflix-test-worker:
+    build: .
+    profiles: ["netflix-test"]
+    environment:
+      BOT_API_URL: http://api:3000
+      BOT_WORKER_ID: ${NETFLIX_WORKER_ID:-netflix-mock-local}
+      BOT_WORKER_TOKEN: ${NETFLIX_WORKER_TOKEN:-}
+      NETFLIX_WORKER_STORE_ID: ${NETFLIX_WORKER_STORE_ID:-}
+    command: ["npm", "run", "netflix-worker"]
+    depends_on:
+      - api
 volumes:
   phase1:
 

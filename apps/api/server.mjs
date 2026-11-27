@@ -8,6 +8,9 @@ import { registerAdmin } from './admin.mjs';
 import { registerJobs, uuid } from './jobs.mjs';
 import { registerWorkflow } from './workflow.mjs';
 import { registerGmail } from './gmail.mjs';
+import { registerNetflixBindings } from './netflix-bindings.mjs';
+import { registerNetflixOwnerAssist } from './netflix-owner-assist.mjs';
+import { gmailConfig } from './gmail-provider.mjs';
 
 export async function appServer(gmailTest) {
   if (process.env.NODE_ENV==='production') throw new Error('The Phase 1 demo cannot run in production');
@@ -41,8 +44,12 @@ export async function appServer(gmailTest) {
   registerAdmin(app,secured);
   registerJobs(secured);
   registerWorkflow(secured);
+  registerNetflixBindings(secured);
+  app.get('/openapi.netflix-binding.v1.yaml',(_req,reply)=>reply.type('application/yaml').send(readFileSync(new URL('../../contracts/openapi.netflix-binding.v1.yaml',import.meta.url))));
   if(gmailTest&&process.env.NODE_ENV!=='test') throw new Error('Gmail injection is restricted to tests');
-  registerGmail(app,secured,gmailTest?.config,gmailTest?.provider);
+  const gmail=gmailTest?.config??gmailConfig();
+  registerGmail(app,secured,gmail,gmailTest?.provider);
+  registerNetflixOwnerAssist(secured,gmail);
   app.get('/openapi.email-bot.v1.yaml',(_req,reply)=>reply.type('application/yaml').send(readFileSync(new URL('../../contracts/openapi.email-bot.v1.yaml',import.meta.url))));
   await app.register(staticFiles,{root:fileURLToPath(new URL('../admin-web/',import.meta.url))});
   return app;

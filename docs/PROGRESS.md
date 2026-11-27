@@ -2,6 +2,8 @@
 
 Gmail Bot Module 01 adds Owner-only Gmail consent and bounded inbox verification in a separate worker namespace. Resume with [implementation findings](EMAIL_BOT_IMPLEMENTATION_PLAN.md), [Thai setup](EMAIL_BOT_SETUP.md) and the [English integration guide](EMAIL_BOT_INTEGRATION_GUIDE_EN.md). On 2026-11-26 at 16:33 Asia/Bangkok, live smoke verification passed after Owner consent. The backend accepted LIVE evidence for identity match, Inbox listing and one metadata read.
 
+Netflix Module 02 adds a mock-only binding state machine, scoped worker and manual synthetic challenge in the streaming email UI. Owner-assisted sign-in adds a bounded Gmail metadata watch and an optional Windows Chrome profile per store and email. Real Netflix binding and verification remain unimplemented. See [setup and limitations](NETFLIX_BINDING_MOCK.md).
+
 | Milestone | State | Evidence |
 |---|---|---|
 | 0 | Done | Workspace inspected. Optional database archive absent. Part E and Part F exported. |

@@ -10,6 +10,10 @@ const customerDirectory={page:0,query:''};
 const inventoryDirectories=new Map();
 let selectedStreamingEmail;
 const errors={
+  get LOCAL_CHROME_UNAVAILABLE(){return t('เปิด Chrome โปรไฟล์แยกในเครื่องนี้ไม่ได้');},
+  get LOCAL_CHROME_PROFILE_MISMATCH(){return t('โปรไฟล์ Chrome ที่ตั้งไว้ไม่ตรงกับอีเมลบัญชีนี้');},
+  get GMAIL_WATCH_NOT_READY(){return t('เชื่อม Gmail จริงแล้วตรวจให้ผ่านก่อนเริ่มรออีเมล');},
+  get GMAIL_WATCH_UNAVAILABLE(){return t('ตรวจอีเมล Netflix ไม่สำเร็จ กรุณาลองใหม่');},
   get GMAIL_CALLBACK_ORIGIN_MISMATCH(){return t('เปิดแอปที่ 127.0.0.1:3000 เพื่อเชื่อม Gmail จริง');},
   get OAUTH_RATE_LIMIT(){return t('สร้างลิงก์หลายครั้งเกินไป กรุณารอสักครู่แล้วลองใหม่');},
   get PRIMARY_PROFILE_RESERVED(){return t('โปรไฟล์หลักไม่สามารถนำไปให้เช่าหรือลบได้');},
@@ -59,6 +63,8 @@ const storeDay=new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Bangkok',year:'nu
 const streamingPlatforms=[['netflix','Netflix']];
 const platformName=platform=>streamingPlatforms.find(([id])=>id===platform)?.[1]??platform;
 const accountLabel=account=>platformName(account.platform)+' · '+account.email.replace(/^(.).*(@.*)$/,'$1•••$2');
+const inventoryAccountStatus=account=>account.owner_confirmed&&account.health!=='BLOCKED'?
+  t('พร้อมใช้งาน (Owner ยืนยัน)'):(status[account.health]??account.health);
 const inventoryAccountLabel=account=>platformName(account.platform)+' · '+account.email;
 const profileStatus={get AVAILABLE(){return t('พร้อมใช้งาน');},get RESERVED(){return t('รอส่งมอบ');},get OCCUPIED(){return t('กำลังใช้งาน');},get HELD(){return t('พักการใช้งาน');}};
 const customerLabel=customer=>customer.name+(customer.alias?' ('+customer.alias+')':'');
@@ -111,6 +117,92 @@ async function request(path,body) {
   return data;
 }
 const shop=(path,body)=>request('stores/'+store+'/'+path,body);
+async function openNetflixChrome(emailId,email){
+  const copied=await navigator.clipboard?.writeText(email).then(()=>true,()=>false);
+  await shop('email-addresses/'+emailId+'/netflix-assist/chrome',{destination:'netflix'});
+  notice(copied?t('เปิด Chrome แล้ว กด Ctrl+V เพื่อวางอีเมล'):email);
+}
+function netflixBindSteps(panel,email,current,onComplete){
+  const path='email-addresses/'+email.id+'/netflix-assist/';
+  let stage=1,watchVersion=0;
+  function step(heading,description){
+    panel.replaceChildren();
+    element('h3',heading,panel);
+    element('p',description,panel);
+  }
+  function button(label,handler){
+    const control=element('button',label,panel);
+    control.type='button';
+    control.onclick=handler;
+    return control;
+  }
+  function start(){
+    stage=1;
+    step(t('เปิด Netflix'),email.email);
+    button(t('เปิด Netflix ในโปรไฟล์ Chrome ของบัญชีนี้'),launch);
+  }
+  async function launch(){
+    step(t('เปิด Netflix'),t('กำลังเปิด Chrome…'));
+    try{
+      await openNetflixChrome(email.id,email.email);
+      if(!current()||!panel.isConnected) return;
+      verification();
+    }catch(error){
+      if(!current()||!panel.isConnected) return;
+      start();
+      element('p',error.message,panel);
+    }
+  }
+  function verification(){
+    stage=2;
+    step(t('ยืนยันบน Netflix'),t('วางอีเมลด้วย Ctrl+V แล้วขอรหัสบน Netflix'));
+    const status=element('p','',panel);
+    status.setAttribute('aria-live','polite');
+    const refresh=button(t('เริ่มรออีเมลจาก Netflix'),()=>startWatch());
+    const gmail=button(t('เปิด Gmail ในโปรไฟล์ Chrome เดียวกัน'),openGmail);
+    async function openGmail(){
+      if(gmail.disabled) return;
+      gmail.disabled=true;
+      try{await shop(path+'chrome',{destination:'gmail'});}catch(error){notice(error.message);}
+      finally{gmail.disabled=false;}
+    }
+    element('p',t('ลองเข้าโปรไฟล์หลักบน Netflix แล้วเลือกผลที่เกิดขึ้นจริง'),panel);
+    const buttons=[
+      button(t('เข้าโปรไฟล์หลักได้'),()=>save(true)),
+      button(t('เข้าโปรไฟล์หลักไม่ได้'),()=>save(false))
+    ];
+    async function startWatch(){
+      const version=++watchVersion;
+      refresh.disabled=true;
+      for(let attempt=0;attempt<20;attempt++){
+        if(!current()||!panel.isConnected||stage!==2||version!==watchVersion) return;
+        try{
+          const response=await shop(path+'watch/'+(attempt===0?'start':'check'),{});
+          if(!current()||!panel.isConnected||stage!==2||version!==watchVersion) return;
+          status.textContent=response.status==='FOUND'?t('พบอีเมลใหม่ที่เข้าข่ายจาก Netflix เปิด Gmail เพื่อตรวจเอง'):
+            response.status==='EXPIRED'?t('ยังไม่พบอีเมลจาก Netflix ภายในเวลาที่รอ'):t('กำลังรออีเมลจาก Netflix');
+          if(response.status==='FOUND') await openGmail();
+          if(response.status!=='WAITING') break;
+        }catch(error){status.textContent=error.message;break;}
+        await new Promise(resolve=>setTimeout(resolve,10000));
+      }
+      refresh.disabled=false;
+    }
+    async function save(entered){
+      for(const control of buttons) control.disabled=true;
+      try{
+        await shop(path+'owner-result',{entered});
+        if(!current()||!panel.isConnected) return;
+        stage=3;
+        watchVersion++;
+        if(entered){await onComplete();notice(t('Bind สำเร็จตามที่ Owner ยืนยัน'));}
+        else{step(t('บันทึกผล Bind'),t('Bind ไม่สำเร็จตามที่ Owner แจ้ง'));button(t('ลองตรวจใหม่'),launch);}
+      }catch(error){notice(error.message);for(const control of buttons) control.disabled=false;}
+    }
+    startWatch();
+  }
+  launch();
+}
 function gmailConnectionPanel(parent,emailId,current){
   const section=element('section',undefined,parent);
   element('h2','Gmail',section);
@@ -596,7 +688,11 @@ function nav() {
   for(const [key,title] of menus){
     const button=element('button',title,panel);
     if(key===page) button.setAttribute('aria-current','page');
-    button.onclick=()=>{page=key;render();};
+    button.onclick=()=>{
+      if(key==='inventory') selectedAccount=undefined;
+      page=key;
+      render();
+    };
   }
 }
 function ownerOverview(overview,renewals,dailySales) {
@@ -852,20 +948,15 @@ async function render() {
         back.onclick=()=>{selectedStreamingEmail=undefined;render();};
         element('h2',details.email);
         gmailConnectionPanel(view,selected.id,current);
-        element('p',t('รหัสผ่านอีเมล')+' · '+(details.password??t(details.password_set?'ต้องตั้งรหัสผ่านอีเมลใหม่เพื่อให้ดูได้':'ยังไม่ได้ตั้งรหัสผ่านอีเมล')));
         element('h2',t('บัญชีที่ผูกแล้ว'));
-        if(selected.gmail_verified&&!selected.bound_platforms.includes('netflix')){
-          const next=element('button',t('เพิ่มบัญชีสตรีมมิงด้วยอีเมลนี้'));
-          next.onclick=()=>{selectedAccount=undefined;page='inventory';render();};
-        }
         for(const account of details.accounts){
           const button=element('button',platformName(account.platform));
           button.onclick=()=>{selectedAccount=account.id;page='inventory';render();};
         }
         if(!details.accounts.length) element('p',t('ยังไม่ได้ผูกบัญชี'));
-        const fields=details.accounts.length?[]:[['email',t('อีเมลบัญชีจำลอง'),{type:'email',value:details.email}]];
-        fields.push(['password',t('รหัสผ่านอีเมลใหม่'),{type:'password',required:!details.password_set,minLength:12,maxLength:128,autocomplete:'new-password'}]);
-        form(t('แก้ไขข้อมูลอีเมล'),fields,data=>shop('streaming-emails/'+details.id,data));
+        if(!details.accounts.length) form(t('แก้ไขข้อมูลอีเมล'),[
+          ['email',t('อีเมลบัญชีจำลอง'),{type:'email',value:details.email}]
+        ],data=>shop('streaming-emails/'+details.id,data));
         form(t('ลบอีเมลและบัญชีที่ผูก'),[],async()=>{
           await shop('streaming-emails/'+details.id+'/archive',{});
           selectedStreamingEmail=undefined;
@@ -892,7 +983,7 @@ async function render() {
       heading.className='inventory-heading';
       const headingText=element('div',undefined,heading);
       element('h1',account?inventoryAccountLabel(account):t('บัญชีสตรีมมิง'),headingText);
-      element('p',account?status[account.health]??account.health:accounts.length+t(' บัญชีที่ผูกไว้'),headingText);
+      element('p',account?inventoryAccountStatus(account):accounts.length+t(' บัญชีที่ผูกไว้'),headingText);
       if(account){
         const back=element('button',t('กลับไปยังรายการบัญชี'),heading);
         back.className='inventory-back';
@@ -976,7 +1067,7 @@ async function render() {
           directoryButtons(section,group,inventoryDirectories.get(key),row=>{selectedAccount=row.id;render();},row=>{
             const matching=profiles.filter(profile=>profile.account_id===row.id&&!profile.is_primary);
             const free=matching.filter(profile=>profile.status==='AVAILABLE').length;
-            return [row.email,(status[row.health]??row.health)+' · '+t('ว่าง ')+free+t(' จาก ')+matching.length+t(' โปรไฟล์')];
+            return [row.email,inventoryAccountStatus(row)+' · '+t('ว่าง ')+free+t(' จาก ')+matching.length+t(' โปรไฟล์')];
           },t('ค้นหาบัญชีสตรีมมิง'),40);
         }
         if(!accounts.length) element('p',t('ยังไม่มีบัญชีสตรีมมิง'),accountPanel).className='inventory-empty';
@@ -987,11 +1078,34 @@ async function render() {
           manage.className='inventory-link';
           manage.onclick=()=>{page='streaming-emails';render();};
         }
+        element('h2',t('ผูกบัญชี Netflix'),bindPanel);
+        const label=element('label',t('อีเมลบัญชีสตรีมมิง'),bindPanel);
+        const picker=element('select',undefined,label);
+        picker.name='bind_email_id';
+        const eligible=emails.filter(row=>row.gmail_verified||row.password_set||row.bound_platforms.includes('netflix'));
+        picker.replaceChildren(new Option(t('เลือกอีเมล'),''),
+          ...eligible.map(row=>new Option(row.email,row.id)));
+        if(eligible.some(row=>row.id===selectedStreamingEmail)) picker.value=selectedStreamingEmail;
+        const netflixLogin=element('button',t('Bind บัญชี'),bindPanel);
+        const steps=element('section',undefined,bindPanel);
+        netflixLogin.disabled=!picker.value;
+        picker.onchange=()=>{
+          netflixLogin.disabled=!picker.value;
+          steps.replaceChildren();
+        };
+        netflixLogin.onclick=()=>{
+          const selected=eligible.find(row=>row.id===picker.value);
+          if(!selected) return;
+          const flow=element('div',undefined,steps);
+          steps.replaceChildren(flow);
+          netflixBindSteps(flow,selected,current,async()=>{selectedAccount=undefined;await render();});
+        };
+        const demo=disclosure(bindPanel,t('เพิ่มบัญชีสตรีมมิงจำลอง'));
         const bind=form(t('เพิ่มบัญชีสตรีมมิงจำลอง'),[
           ['platform',t('แพลตฟอร์ม'),'',streamingPlatforms],['email_id',t('อีเมลบัญชีสตรีมมิง'),'',[]],
           ['profile_count',t('จำนวนโปรไฟล์'),{type:'number',min:1,max:100,step:1,value:5}],
           ...accountCostFields()
-        ],data=>shop('accounts',{...data,profile_count:Number(data.profile_count)}),bindPanel,t('Bind บัญชี'));
+        ],data=>shop('accounts',{...data,profile_count:Number(data.profile_count)}),demo,t('สร้างบัญชีจำลอง'));
         const showEmails=()=>{
           const available=emails.filter(row=>(row.gmail_verified||row.password_set)&&!row.bound_platforms.includes(bind.elements.platform.value));
           bind.elements.email_id.replaceChildren(new Option(available.length?t('เลือกอีเมล'):t('ไม่มีอีเมลพร้อมผูกบัญชี'),''),

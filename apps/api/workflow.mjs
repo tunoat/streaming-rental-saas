@@ -181,10 +181,22 @@ const verifiedGmail=`EXISTS (SELECT 1 FROM gmail_connections g
   WHERE (g.store_id,g.email_id,g.email)=(e.store_id,e.id,e.email)
   AND g.status='CONNECTED' AND g.evidence->>'provenance'=upper(g.mode)
   AND g.evidence->>'identity_match'='true')`;
+export async function createInventoryAccount(q,store,platform,email,profileCount,plan){
+  const {rows:[{count}]}=await q('SELECT count(DISTINCT email)::int AS count FROM accounts WHERE store_id=$1 AND email<>$2 AND archived_at IS NULL',[store,email]);
+  if(count>=({STARTER:20,PRO:100,BUSINESS:200})[plan]) reject(409,'EMAIL_QUOTA');
+  await q('INSERT INTO streaming_emails(store_id,platform,email) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',[store,platform,email]);
+  const {rows:[account]}=await q('INSERT INTO accounts(store_id,platform,email) VALUES($1,$2,$3) RETURNING id',[store,platform,email]);
+  await q(`INSERT INTO profiles(store_id,account_id,label,is_primary)
+    SELECT $1,$2,'profile'||number,number=1 FROM generate_series(1,$3::integer) AS series(number)`,[store,account.id,profileCount]);
+  return account;
+}
 const entities = {
   customers:'SELECT c.id,c.name,c.alias,c.url,COALESCE(sum(l.amount),0)::numeric(18,2) AS balance FROM customers c LEFT JOIN wallet_entries l ON c.store_id=l.store_id AND c.id=l.customer_id WHERE c.store_id=$1 GROUP BY c.store_id,c.id ORDER BY c.name,c.id',
   'customer-directory':'SELECT id,name,alias,url FROM customers WHERE store_id=$1 ORDER BY name,id',
-  accounts:'SELECT id,platform,email,health,subscription_until FROM accounts WHERE store_id=$1 AND archived_at IS NULL ORDER BY platform,email',
+  accounts:`SELECT a.id,a.platform,a.email,a.health,a.subscription_until,
+    EXISTS (SELECT 1 FROM streaming_email_addresses e JOIN netflix_owner_confirmation n ON (n.store_id,n.email_id)=(e.store_id,e.id)
+      WHERE (e.store_id,e.email)=(a.store_id,a.email) AND e.archived_at IS NULL AND n.entered AND a.platform='netflix') AS owner_confirmed
+    FROM accounts a WHERE a.store_id=$1 AND a.archived_at IS NULL ORDER BY a.platform,a.email`,
   'streaming-emails':`SELECT e.id,e.email,e.password_hash IS NOT NULL AS password_set,${verifiedGmail} AS gmail_verified,
     coalesce(array_agg(a.platform ORDER BY a.platform)
     FILTER (WHERE a.id IS NOT NULL),ARRAY[]::text[]) AS bound_platforms
@@ -610,13 +622,7 @@ export function registerWorkflow(secured) {
     const {rows:[credential]}=await q(`SELECT e.email,(e.password_hash IS NOT NULL OR ${verifiedGmail}) AS ready
       FROM streaming_email_addresses e WHERE (e.store_id,e.id)=($1,$2) AND e.archived_at IS NULL`,[s,validId(b.email_id)]);
     if (!credential?.ready) reject(400,'STREAMING_EMAIL_NOT_READY');
-    const {email}=credential;
-    const {rows:[{count}]}=await q('SELECT count(DISTINCT email)::int AS count FROM accounts WHERE store_id=$1 AND email<>$2 AND archived_at IS NULL',[s,email]);
-    if (count>=({STARTER:20,PRO:100,BUSINESS:200})[req.plan]) reject(409,'EMAIL_QUOTA');
-    await q('INSERT INTO streaming_emails(store_id,platform,email) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',[s,platform,email]);
-    const account=await insert(q,'INSERT INTO accounts(store_id,platform,email) VALUES($1,$2,$3) RETURNING id',[s,platform,email]);
-    await q(`INSERT INTO profiles(store_id,account_id,label,is_primary)
-      SELECT $1,$2,'profile'||number,number=1 FROM generate_series(1,$3::integer) AS series(number)`,[s,account.id,profileCount]);
+    const account=await createInventoryAccount(q,s,platform,credential.email,profileCount,req.plan);
     await saveAccountCost(q,s,account.id,auth.id,costs);
     return account;
   },{sale:true});

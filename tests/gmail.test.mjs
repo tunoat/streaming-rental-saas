@@ -5,6 +5,8 @@ import pg from 'pg';
 import {exchangeGoogle,gmailConfig,googleJson,readScope,seal,unseal} from '../apps/api/gmail-provider.mjs';
 import {GmailWorkerClient} from '../packages/shared/gmail-worker-client.mts';
 import {GoogleGmailAdapter,runGmailOnce} from '../apps/gmail-worker/worker.mjs';
+import {runNetflixOnce} from '../apps/netflix-worker/worker.mjs';
+import {chromeLaunchArguments,chromeProfileArgument,hasNewNetflixMail} from '../apps/api/netflix-owner-assist.mjs';
 
 const integration=Boolean(process.env.TEST_DATABASE_URL&&process.env.DATABASE_URL);
 const opts={skip:!integration&&'Use a disposable migrated PostgreSQL database'};
@@ -16,6 +18,37 @@ const live=gmailConfig({GMAIL_ADAPTER:'live',GMAIL_LIVE_TEST_ENABLED:'true',NODE
 let db,pool,mockApp,liveApp,mockBase,liveBase,store,otherStore,owner,outsider,staff,createWorker;
 const sampleToken={access:'synthetic-access',refresh:'synthetic-refresh',expires:new Date(Date.now()+3600000).toISOString()};
 const contact='authorized@example.invalid';
+test('Chrome profile override is store and email scoped and checks the Chrome account',()=>{
+  const mapping=JSON.stringify({'store-a/email-1':'Profile 1'});
+  const read=()=>JSON.stringify({profile:{info_cache:{'Profile 1':{user_name:contact}}}});
+  assert.equal(chromeProfileArgument('local','store-a','email-1',contact,mapping,read),'--profile-directory=Profile 1');
+  assert.match(chromeProfileArgument('local','store-b','email-1',contact,mapping,read),/^--user-data-dir=/);
+  assert.throws(()=>chromeProfileArgument('local','store-a','email-1','wrong@example.invalid',mapping,read),/mismatch/);
+  assert.deepEqual(chromeLaunchArguments('--profile-directory=Profile 1','gmail'),
+    ['--profile-directory=Profile 1','--no-first-run','https://mail.google.com/mail/u/0/#inbox']);
+  assert.ok(chromeLaunchArguments('--profile-directory=Profile 1','netflix').includes('--new-window'));
+});
+test('Netflix mail watch checks only bounded Inbox metadata after the watch start',async()=>{
+  const started=new Date('2026-11-26T09:15:00Z');
+  const read=async(url,options)=>{
+    const request=new URL(url);
+    assert.equal(request.hostname,'gmail.googleapis.com');
+    assert.equal(options.method,undefined);
+    if(request.pathname.endsWith('/messages')){
+      assert.equal(request.searchParams.get('labelIds'),'INBOX');
+      assert.equal(request.searchParams.get('maxResults'),'3');
+      return Response.json({messages:[{id:'stale'},{id:'different'},{id:'fresh'}]});
+    }
+    assert.equal(request.searchParams.get('format'),'metadata');
+    assert.equal(request.searchParams.get('metadataHeaders'),'From');
+    assert.equal(request.searchParams.get('fields'),'internalDate,payload(headers)');
+    const id=request.pathname.split('/').at(-1);
+    return Response.json({internalDate:String(started.getTime()+(id==='stale'?-1:1)),
+      payload:{headers:[{name:'From',value:id==='different'?'unknown@example.invalid':'Netflix <info@account.netflix.com>'}]}});
+  };
+  assert.equal(await hasNewNetflixMail('fake-access',started,read),true);
+  assert.equal(await hasNewNetflixMail('fake-access',started,async()=>Response.json({messages:[]})),false);
+});
 let refreshCalls=0;
 
 async function call(base,path,{token,body,status=200,key=randomUUID(),headers={}}={}){
@@ -166,6 +199,8 @@ test('mock OAuth state is bound, one-time, denied safely and verified by its own
   assert.equal(final.evidence.provenance,'MOCK');
   assert.equal(final.evidence.empty_inbox,true);
   assert.equal(final.evidence.metadata_read,false);
+  const watch=await call(mockBase,path+'/netflix-assist/watch/start',{token:owner,body:{},status:409});
+  assert.equal(watch.data.code,'GMAIL_WATCH_NOT_READY');
   const list=async()=> (await call(mockBase,streamingRoot+'streaming-emails',{token:owner})).data.find(row=>row.id===email);
   assert.deepEqual([(await list()).password_set,(await list()).gmail_verified,(await list()).bound_platforms],[false,true,[]]);
   await call(mockBase,streamingRoot+'accounts',{token:owner,body:binding});
@@ -294,4 +329,50 @@ test('Gmail and streaming claims share four slots and expired leases are fenced'
   const reclaimed=await worker.client.claim();
   assert.equal(reclaimed.id,initial.id);
   assert.equal(reclaimed.fence,initial.fence+1);
+});
+
+test('Netflix mock binding requires valid Gmail and worker evidence after manual verification',opts,async()=>{
+  const email=await emailFixture('netflix-'+randomUUID()+'@example.invalid'),path=route(store,email);
+  const binding=path+'/streaming-binding';
+  await call(mockBase,binding+'/bind',{token:owner,body:{},status:409});
+  await call(mockBase,binding,{token:staff,status:403});
+  const proof=fromConsent(await authorize(mockBase,path,owner));
+  assert.match((await callback(mockBase,proof,{decision:'allow'})).headers.get('location'),/accepted$/);
+  const mail=await createWorker('mock');
+  await db.query("UPDATE jobs SET lease_until=now()-interval '1 second' WHERE store_id=$1 AND status IN ('LEASED','RUNNING')",[store]);
+  const gmailJob=await db.query("SELECT id FROM gmail_jobs WHERE store_id=$1 AND email_id=$2 AND status='QUEUED'",[store,email]);
+  assert.equal(gmailJob.rowCount,1);
+  await db.query("UPDATE gmail_jobs SET status='CANCELLED',lease_until=NULL WHERE store_id=$1 AND email_id<>$2 AND status IN ('QUEUED','LEASED','RUNNING')",[store,email]);
+  assert.equal((await runGmailOnce(mail.client)).status,'CONNECTED');
+  const worker=await createWorker();
+  await db.query('INSERT INTO netflix_workers VALUES($1)',[worker.id]);
+  const config={base:mockBase,store,worker:worker.id,token:worker.token};
+  const start=await call(mockBase,binding+'/bind',{token:owner,body:{challenge:'MANUAL'},status:202});
+  await call(mockBase,binding+'/bind',{token:owner,body:{challenge:'MANUAL'},status:409});
+  assert.equal((await runNetflixOnce(config)).status,'WAITING_FOR_USER');
+  const manual=await call(mockBase,binding+'/manual',{token:owner,body:{generation:start.data.generation,code:'123456'}});
+  assert.equal(manual.data.status,'VERIFYING');
+  assert.equal((await runNetflixOnce(config)).status,'BOUND');
+  assert.equal((await call(mockBase,binding+'/disconnect',{token:owner,body:{confirm:true}})).data.status,'UNBOUND');
+});
+
+test('Netflix Owner can record profile access independently of mock binding',opts,async()=>{
+  const email=await emailFixture('owner-result-'+randomUUID()+'@example.invalid');
+  const path=route(store,email)+'/netflix-assist/owner-result';
+  await call(mockBase,path,{token:staff,body:{entered:true},status:403});
+  assert.equal((await call(mockBase,path,{token:owner})).data.entered,null);
+  await call(mockBase,path,{token:owner,body:{entered:true,pin:'test'},status:400});
+  const failed=(await call(mockBase,path,{token:owner,body:{entered:false}})).data;
+  assert.deepEqual([failed.entered,failed.account_id],[false,null]);
+  const success=(await call(mockBase,path,{token:owner,body:{entered:true}})).data;
+  assert.ok(success.entered&&success.account_id);
+  const repeat=(await call(mockBase,path,{token:owner,body:{entered:true}})).data;
+  assert.equal(repeat.account_id,success.account_id);
+  const inventory='/v1/stores/'+store+'/';
+  assert.equal((await call(mockBase,inventory+'accounts',{token:owner})).data.find(row=>row.id===success.account_id).owner_confirmed,true);
+  const profiles=(await call(mockBase,inventory+'profiles',{token:owner})).data.filter(row=>row.account_id===success.account_id);
+  assert.equal(profiles.length,5);
+  assert.equal(profiles.filter(row=>row.is_primary).length,1);
+  assert.equal((await call(mockBase,path,{token:owner})).data.entered,true);
+  assert.equal((await call(mockBase,route(store,email)+'/streaming-binding',{token:owner})).data.status,'UNBOUND');
 });
